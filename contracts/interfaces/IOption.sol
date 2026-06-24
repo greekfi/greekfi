@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
 /// @notice Minimal ERC20 metadata bundle returned by {IOption.balancesOf} and {IOption.details}.

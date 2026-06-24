@@ -38,3 +38,10 @@ forge build
 | [greekfi/clone](https://github.com/greekfi/clone) | `v0.2.1` |
 
 Compiler: solc 0.8.35, `via_ir = true`, optimizer 200 runs, `evm_version = "osaka"`.
+
+## License
+
+[Business Source License 1.1](LICENSE) (`BUSL-1.1`). Source-available with
+non-production use permitted; production use requires a commercial license from
+the Licensor until the **Change Date of 2029-06-23** (3 years), at which point
+the code converts to the **BSD 3-Clause License**.
