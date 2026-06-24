@@ -60,6 +60,9 @@ interface IOption {
     ///         dangerous `exerciseFor` overloads) the collateral recipient; `holder`'s options are
     ///         burned.
     event Exercise(address longOption, address caller, address holder, uint256 amount);
+    /// @notice Emitted on {IOption.expire} when a holder burns expired (post-deadline) long tokens.
+    ///         `caller == holder` (you can only expire your own options).
+    event Expire(address longOption, address caller, address holder, uint256 amount);
 
     /// @notice A path that requires a live option was called after expiration.
     error ContractExpired();
@@ -73,6 +76,8 @@ interface IOption {
     error AlreadyInitialized();
     /// @notice Caller is not authorised for the requested operation.
     error Unauthorized();
+    /// @notice {expire} called on or before `exerciseDeadline` — the option is still live.
+    error NotYetExpired();
 
     /// @notice Paired short-side Receipt contract.
     function receipt() external view returns (address);
@@ -128,11 +133,16 @@ interface IOption {
     /// @return Amount actually exercised (`== amount` on success).
     function exerciseFor(address holder, uint256 amount) external returns (uint256);
     /// @notice Batch variant of {exerciseFor(address,uint256)}. Exercises `amounts[i]` of `holders[i]`
-    ///         (arrays must be equal length). Entries that fail the per-holder allowance check or carry
-    ///         a zero amount are skipped; an amount exceeding a holder's balance reverts the call.
+    ///         (arrays must be equal length). Entries that fail the per-holder allowance check, carry a
+    ///         zero amount, or request more than the holder's balance (`balanceOf(holder) < amount`) are
+    ///         skipped rather than reverting, so one stale entry can't grief the whole sweep.
     function exerciseFor(address[] calldata holders, uint256[] calldata amounts) external;
 
     /// @notice Pair-burn matched Option + Receipt to recover collateral. Allowed up to and including
     ///         `exerciseDeadline` (boundary inclusive). Caller must hold both sides in equal amount.
     function burn(uint256 amount) external;
+    /// @notice Burn the caller's own expired long tokens (post-`exerciseDeadline` cleanup). Long side
+    ///         only — leaves the Receipt and collateral pool untouched. Reverts `NotYetExpired` on or
+    ///         before the deadline.
+    function expire(uint256 amount) external;
 }
