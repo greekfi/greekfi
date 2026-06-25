@@ -141,8 +141,9 @@ interface IOption {
     /// @notice Pair-burn matched Option + Receipt to recover collateral. Allowed up to and including
     ///         `exerciseDeadline` (boundary inclusive). Caller must hold both sides in equal amount.
     function burn(uint256 amount) external;
-    /// @notice Burn the caller's own expired long tokens (post-`exerciseDeadline` cleanup). Long side
-    ///         only — leaves the Receipt and collateral pool untouched. Reverts `NotYetExpired` on or
-    ///         before the deadline.
-    function expire(uint256 amount) external;
+    /// @notice Burn `holder`'s expired long tokens (post-`exerciseDeadline` cleanup). Caller must be
+    ///         `holder` or authorised via `factory.allowExercise(holder, true)`. Long side only —
+    ///         leaves the Receipt and collateral pool untouched. Reverts `NotYetExpired` on or before
+    ///         the deadline, `Unauthorized` if the caller lacks the holder's grant.
+    function expire(address holder, uint256 amount) external;
 }

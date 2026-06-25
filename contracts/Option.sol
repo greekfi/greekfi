@@ -434,7 +434,7 @@ contract Option is ERC20, ReentrancyGuardTransient {
         receipt.burn(msg.sender, amount);
     }
 
-    /// @notice Burn your own expired long option tokens to clean up dust.
+    /// @notice Burn expired long option tokens to clean up dust.
     /// @dev    Only callable strictly after `exerciseDeadline`. Past the deadline an unexercised
     ///         long token is inert — it can no longer be exercised ({canExercise}), transferred or
     ///         pair-burned ({beforeDeadline}) — so it would otherwise sit in the holder's wallet
@@ -442,11 +442,16 @@ contract Option is ERC20, ReentrancyGuardTransient {
     ///         `Receipt`, so it has no effect on the redemption pool or the solvency invariant
     ///         (short-side collateral is recovered separately via `Receipt.redeem`). Reverts with
     ///         `NotYetExpired` on or before the deadline — use {burn} or {exercise} while live.
+    ///         Caller must be `holder` or authorised via `factory.allowExercise(holder, true)`
+    ///         (reverts `Unauthorized` otherwise); unlike {exerciseFor} this is harmless — the
+    ///         tokens are already worthless, so a keeper gains nothing by burning them.
+    /// @param holder Address of the long option holder.
     /// @param amount Amount of long option tokens to burn.
-    function expire(uint256 amount) public nonReentrant nonZero(amount) {
+    function expire(address holder, uint256 amount) public nonReentrant nonZero(amount) {
+        if (msg.sender != holder && !FACTORY.exerciseAllowed(holder, msg.sender)) revert Unauthorized();
         if (block.timestamp <= exerciseDeadline()) revert NotYetExpired();
-        _burn(msg.sender, amount);
-        emit Expire(address(this), msg.sender, msg.sender, amount);
+        _burn(holder, amount);
+        emit Expire(address(this), holder, msg.sender, amount);
     }
 
     // ============ QUERY ============
