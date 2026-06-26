@@ -451,7 +451,7 @@ contract Option is ERC20, ReentrancyGuardTransient {
         if (msg.sender != holder && !FACTORY.exerciseAllowed(holder, msg.sender)) revert Unauthorized();
         if (block.timestamp <= exerciseDeadline()) revert NotYetExpired();
         _burn(holder, amount);
-        emit Expire(address(this), holder, msg.sender, amount);
+        emit Expire(address(this), msg.sender, holder, amount);
     }
 
     // ============ QUERY ============
