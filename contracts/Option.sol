@@ -361,7 +361,6 @@ contract Option is ERC20, ReentrancyGuardTransient {
     ///                 // 2. Approve the factory to pull the consideration we just borrowed.
     ///                 IReceipt r = IReceipt(opt.receipt());
     ///                 IERC20(r.consideration()).approve(factory, loaned);
-    ///                 factory.approve(address(r.consideration()), loaned);
     ///
     ///                 // 3. Exercise on behalf of the holder. Collateral lands here.
     ///                 opt.exerciseFor(holder, amount);

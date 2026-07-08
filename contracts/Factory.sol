@@ -17,7 +17,7 @@ import { CreateParams } from "./interfaces/IFactory.sol";
 using SafeERC20 for IERC20;
 
 /**
- * @title  Factory — deployer, allowance hub, operator registry
+ * @title  Factory — deployer, transfer hub, operator registry
  * @author Greek.fi
  * @notice The only on-chain contract users need to interact with to *create* options. Once deployed,
  *         every Option + Receipt pair runs off pre-compiled template clones, so creation is
@@ -25,9 +25,10 @@ using SafeERC20 for IERC20;
  *
  *         The factory also plays three lasting roles post-creation:
  *
- *         1. **Single allowance point.** Users `approve(collateralToken, amount)` on the factory once,
- *            and any Option / Receipt pair created by this factory can pull from that allowance
- *            via {transferFrom}. No need to approve every new option individually.
+ *         1. **Single allowance point.** Users `approve(factory, amount)` on the *token* once
+ *            (standard ERC-20 approval), and any Option / Receipt pair created by this factory can
+ *            pull from that allowance via {transferFrom}. No need to approve every new option
+ *            individually — the token allowance to the factory is the sole gate.
  *
  *         2. **Operator registry.** {approveOperator} gives an address blanket authority to move
  *            any Option produced by this factory on your behalf — the ERC-1155-style "setApprovalForAll"
@@ -82,7 +83,7 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     uint40 public constant DEFAULT_EXERCISE_WINDOW = 8 hours;
 
     /// @notice `true` if the address is a Receipt clone this factory created. Doubles as the auth
-    ///         gate for {transferFrom} — only registered Receipts can pull from factory allowances.
+    ///         gate for {transferFrom} — only registered Receipts can pull collateral/consideration.
     ///         Validate an Option by reading its `receipt()` and confirming
     ///         `factory.receipts(rec) && Receipt(rec).option() == opt`.
     mapping(address => bool) public receipts;
@@ -93,9 +94,6 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     ///         Option instead of deploying a duplicate, so identical markets stay canonical/deduped
     ///         and existence is queryable on-chain.
     mapping(bytes32 => address) public optionFor;
-
-    /// @dev Per-token allowance table: `_allowances[token][owner] -> amount`.
-    mapping(address => mapping(address => uint256)) private _allowances;
 
     /// @dev Operator approval table: `_approvedOperators[owner][operator] -> bool`.
     mapping(address => mapping(address => bool)) private _approvedOperators;
@@ -152,8 +150,6 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     event RedeemApproval(address indexed holder, address indexed redeemer, bool allowed);
     /// @notice Emitted on {enableAutoMintBurn}.
     event AutoMintBurnUpdated(address indexed account, bool enabled);
-    /// @notice Emitted on {approve} (factory-level allowance set by token owner).
-    event Approval(address indexed token, address indexed owner, uint256 amount);
 
     /// @notice Deploys the Option and Receipt templates internally so they record this factory
     ///         as their immutable `factory` (used to gate `init` and skip per-clone storage).
@@ -267,9 +263,12 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
 
     /// @notice Pull `amount` of `token` from `from` to `to`. Only callable by Receipt clones
     ///         that this factory has created.
-    /// @dev    Decrements `_allowances[token][from]` (unless it is `type(uint256).max`).
-    ///         This is the mechanism by which a single user approval on the factory flows to every
-    ///         option pair it creates, rather than requiring approvals on each Receipt clone.
+    /// @dev    Authorisation and accounting ride entirely on the underlying ERC-20 allowance:
+    ///         `from` grants `token.approve(factory, amount)` once and every Receipt clone this
+    ///         factory created can pull against it (gated here by the `receipts[]` registry).
+    ///         `safeTransferFrom` decrements that allowance normally (or leaves it untouched at
+    ///         `type(uint256).max`). A balance-delta check rejects fee-on-transfer / short-delivery
+    ///         tokens, which would otherwise corrupt the 1:1 collateral accounting.
     /// @param from   Token owner.
     /// @param to     Recipient (typically the calling Receipt contract).
     /// @param amount Token amount to transfer.
@@ -277,40 +276,10 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     /// @return success Always `true` on success; reverts otherwise.
     function transferFrom(address from, address to, uint256 amount, address token) external nonReentrant returns (bool) {
         if (!receipts[msg.sender]) revert InvalidAddress();
-        uint256 currentAllowance = _allowances[token][from];
-        if (currentAllowance < amount) revert ERC20InsufficientAllowance(msg.sender, currentAllowance, amount);
-        if (currentAllowance != type(uint256).max) {
-            _allowances[token][from] = currentAllowance - amount;
-        }
         uint256 balanceBefore = IERC20(token).balanceOf(to);
         IERC20(token).safeTransferFrom(from, to, amount);
         if (IERC20(token).balanceOf(to) - balanceBefore != amount) revert FeeOnTransferNotSupported();
         return true;
-    }
-
-    /// @notice Factory-level allowance lookup: how much of `token` can the factory pull from `owner_`?
-    /// @param token  Token.
-    /// @param owner_ Token owner.
-    /// @return Current allowance.
-    function allowance(address token, address owner_) public view returns (uint256) {
-        return _allowances[token][owner_];
-    }
-
-    /// @notice Permit2-style allowance: caller authorises the factory to pull up to `amount` of
-    ///         `token` (collateral or consideration) on their behalf when any Option / Receipt
-    ///         pair created by this factory needs to move it. The user must also have granted the
-    ///         underlying `token.approve(factory, ...)` so `safeTransferFrom` can land.
-    /// @dev    The allowance fans out to every Receipt clone (gated by the `receipts[]` registry)
-    ///         and is consumed by `mint`, `exercise`, and — if {enableAutoMintBurn} is `true` —
-    ///         the auto-mint leg of Option transfers triggered by approved operators. Granting
-    ///         a large allowance here while also holding active {approveOperator} grants with
-    ///         {enableAutoMintBurn} on is functionally equivalent to a permit on the underlying
-    ///         token in favour of those operators.
-    /// @param token  ERC20 to be approved.
-    /// @param amount Allowance to grant (use `type(uint256).max` for infinite, `0` to revoke).
-    function approve(address token, uint256 amount) public nonZeroAddr(token) {
-        _allowances[token][msg.sender] = amount;
-        emit Approval(token, msg.sender, amount);
     }
 
     // ============ OPERATOR APPROVAL ============

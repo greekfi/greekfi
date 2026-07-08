@@ -26,10 +26,10 @@ struct CreateParams {
     uint40 windowSeconds;
 }
 
-/// @title  IFactory — option pair deployer + allowance hub
+/// @title  IFactory — option pair deployer + transfer hub
 /// @author Greek.fi
-/// @notice Deploys Option + Receipt pairs via EIP-1167 clones, serves as the single ERC20 approval
-///         point for every option pair it creates, and holds an operator + auto-mint-redeem registry.
+/// @notice Deploys Option + Receipt pairs via EIP-1167 clones, serves as the single ERC20-allowance
+///         pull point for every option pair it creates, and holds an operator + auto-mint-redeem registry.
 interface IFactory {
     /// @notice Emitted for every newly-created option.
     event OptionCreated(
@@ -47,8 +47,6 @@ interface IFactory {
     event OperatorApproval(address indexed owner, address indexed operator, bool approved);
     /// @notice Emitted on {enableAutoMintBurn}.
     event AutoMintBurnUpdated(address indexed account, bool enabled);
-    /// @notice Emitted on {approve} (factory-level allowance set).
-    event Approval(address indexed token, address indexed owner, uint256 amount);
 
     /// @notice Zero address supplied where a contract is required.
     error InvalidAddress();
@@ -74,8 +72,6 @@ interface IFactory {
     /// @notice Deterministic registry key for a set of economic params. Folds in all seven
     ///         {CreateParams} fields; differing in any field yields a different key.
     function optionKey(CreateParams memory p) external pure returns (bytes32);
-    /// @notice Factory-level allowance: how much of `token` the factory may pull from `owner`.
-    function allowance(address token, address owner) external view returns (uint256);
     /// @notice `true` if `account` has opted into Option's auto-mint / auto-redeem transfer hooks.
     function autoMintBurn(address account) external view returns (bool);
     /// @notice `true` if `operator` has blanket authority over `owner`'s Option tokens.
@@ -90,10 +86,8 @@ interface IFactory {
     function createOption(CreateParams memory params) external returns (address);
     /// @notice Batch form of {createOption}.
     function createOptions(CreateParams[] memory params) external returns (address[] memory);
-    /// @notice Pull tokens via the factory-level allowance. Only callable by Collateral clones.
+    /// @notice Pull tokens via the token's ERC-20 allowance to the factory. Only callable by Receipt clones.
     function transferFrom(address from, address to, uint256 amount, address token) external returns (bool success);
-    /// @notice Set the caller's factory-level allowance for `token`.
-    function approve(address token, uint256 amount) external;
     /// @notice Opt-in / opt-out of Option's auto-mint-on-transfer / auto-redeem-on-receive behaviour.
     function enableAutoMintBurn(bool enabled) external;
     /// @notice Grant / revoke blanket operator authority over the caller's options.
