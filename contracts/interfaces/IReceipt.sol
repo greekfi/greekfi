@@ -14,11 +14,13 @@ interface IReceipt {
 
     /// @notice Caller is not the paired Option (or, for `sweep`, not the factory owner).
     error UnauthorizedCaller();
-    /// @notice A path that requires a live option was called after expiration.
+    /// @notice Never thrown by Receipt itself — the pre-expiry mint gate lives in the paired
+    ///         Option. Declared for ABI/tooling parity.
     error ContractExpired();
     /// @notice Zero-amount (or derived-zero) mutation rejected.
     error ZeroValue();
-    /// @notice Exercise / burn attempted after `exerciseDeadline`.
+    /// @notice Never thrown by Receipt itself — the exercise-deadline gate lives in the paired
+    ///         Option. Declared for ABI/tooling parity.
     error ExerciseWindowClosed();
     /// @notice Post-window-only path called while the exercise window is still open.
     error ExerciseWindowOpen();
@@ -26,7 +28,8 @@ interface IReceipt {
     error BeforeExerciseWindow();
     /// @notice `sweep` called while receipts are still outstanding.
     error OutstandingReceipts();
-    /// @notice `_redeem` cannot pay the collateral leg — pool short of `collPay`.
+    /// @notice The consideration or collateral pool cannot fully fund its leg of the requested
+    ///         redemption — split into smaller amounts.
     error InsufficientPool();
 
     /// @notice Strike price (18-decimal fixed point, consideration per collateral; inverted for puts).
@@ -63,8 +66,8 @@ interface IReceipt {
     ///         `round=false` rounds down (used for payouts).
     function toConsideration(uint256 amount, bool round) external pure returns (uint256);
     /// @notice Inverse of {toConsideration} — how much collateral a given consideration amount is worth
-    ///         (floor by design; used by `_redeem` to compute the receipt count fully covered by the
-    ///         current cons balance).
+    ///         (floor by design). Not used internally — exposed for off-chain indexers and
+    ///         invariant tests.
     function toCollateral(uint256 consAmount) external pure returns (uint256);
 
     /// @notice Mint (Option-only). Pulls collateral from `account` via the factory.
@@ -76,7 +79,8 @@ interface IReceipt {
     function exercise(address account, uint256 amount) external;
 
     /// @notice Redeem the caller's full receipt balance. Cons-first, then collateral 1:1 for any
-    ///         remainder. Cons leg has no time gate; collateral leg requires
+    ///         remainder. Cons leg is FCFS whenever the pool can cover it (European: not before
+    ///         `expirationDate`); collateral leg requires
     ///         `block.timestamp > exerciseDeadline`.
     function redeem() external;
     /// @notice Redeem `amount` of the caller's receipts. Same cons-first semantics as `redeem()`.

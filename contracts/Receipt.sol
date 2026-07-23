@@ -92,11 +92,13 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
 
     /// @notice Thrown when a privileged path is called by anyone other than the paired {Option}.
     error UnauthorizedCaller();
-    /// @notice Thrown when a pre-expiry-only path (mint) runs after expiration.
+    /// @notice Never thrown by Receipt itself — the pre-expiry mint gate is enforced by the paired
+    ///         {Option} (`notExpired` on `mint_`). Declared for ABI/tooling parity.
     error ContractExpired();
     /// @notice Thrown on `amount == 0` (or any derived zero-amount the invariant requires to be positive).
     error ZeroValue();
-    /// @notice Thrown when exercise is attempted after `exerciseDeadline`.
+    /// @notice Never thrown by Receipt itself — the exercise-deadline gate is enforced by the
+    ///         paired {Option} (`canExercise` / `beforeDeadline`). Declared for ABI/tooling parity.
     error ExerciseWindowClosed();
     /// @notice Thrown when a post-window-only path is called before the window closes.
     error ExerciseWindowOpen();
@@ -106,7 +108,7 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
     error BeforeExerciseWindow();
     /// @notice Thrown when {sweep} is called while receipts are still outstanding.
     error OutstandingReceipts();
-    /// @notice Thrown when neither the consideration nor the collateral pool can fully fund the
+    /// @notice Thrown when the consideration or collateral pool cannot fully fund its leg of the
     ///         requested redemption — caller should split into smaller amounts.
     error InsufficientPool();
 
@@ -215,9 +217,9 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
     // ============ PAIR BURN (called by Option) ============
 
     /// @notice Burn matched Option + Receipt pair, return collateral. Only callable by Option.
-    /// @dev    Trusts Option's own gating: direct `Option.burn` enforces `notExpired`
-    ///         (pre-expiration only), while the auto-burn leg of `Option._settledTransfer` runs
-    ///         under `beforeDeadline` (pre-`exerciseDeadline`). Once everyone is post-settlement,
+    /// @dev    Trusts Option's own gating: direct `Option.burn` and the auto-burn leg of
+    ///         `Option._settledTransfer` both run under `beforeDeadline` (up to and including
+    ///         `exerciseDeadline`). Once everyone is post-settlement,
     ///         all short-side exits must go through `_redeem`.
     /// @param account Recipient of the collateral.
     /// @param amount  Amount of Receipt tokens to burn.
@@ -247,7 +249,8 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
 
     /// @notice Redeem the caller's full Receipt balance.
     /// @dev    Cons-first, FCFS: pays up to `consBacked` receipt-units from the
-    ///         consideration pool at strike rate, callable any time the pool can cover them.
+    ///         consideration pool at strike rate, callable any time the pool can cover them
+    ///         (European: not before `expirationDate` — reverts {BeforeExerciseWindow}).
     ///         Any uncovered remainder is paid 1:1 in collateral **only after** `exerciseDeadline`;
     ///         pre-window, uncovered receipts stay in the caller's balance for later redemption.
     ///

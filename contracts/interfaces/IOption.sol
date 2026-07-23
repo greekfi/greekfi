@@ -60,8 +60,9 @@ interface IOption {
     ///         dangerous `exerciseFor` overloads) the collateral recipient; `holder`'s options are
     ///         burned.
     event Exercise(address longOption, address caller, address holder, uint256 amount);
-    /// @notice Emitted on {IOption.expire} when a holder burns expired (post-deadline) long tokens.
-    ///         `caller == holder` (you can only expire your own options).
+    /// @notice Emitted on {IOption.expire} when expired (post-deadline) long tokens are burned.
+    ///         `caller` is the holder themselves, or a keeper the holder authorised via
+    ///         `factory.allowExercise`.
     event Expire(address longOption, address caller, address holder, uint256 amount);
 
     /// @notice A path that requires a live option was called after expiration.
@@ -70,6 +71,8 @@ interface IOption {
     error ZeroValue();
     /// @notice Exercise / transfer / burn attempted past the exercise-window boundary.
     error ExerciseWindowClosed();
+    /// @notice Batch `exerciseFor` given `holders`/`amounts` arrays of unequal length.
+    error InvalidValue();
     /// @notice Pre-expiry exercise attempted on a European option, or other window violation.
     error InvalidExercise();
     /// @notice `init` called twice (or on the template itself, which carries the `0xdead` sentinel).
@@ -115,8 +118,9 @@ interface IOption {
 
     /// @notice Mint `amount` options to the caller.
     function mint(uint256 amount) external;
-    /// @notice Mint `amount` options on behalf of `account`. Caller must be `account` or have been
-    ///         granted `factory.approveOperator(account, msg.sender)`.
+    /// @notice Mint `amount` options on behalf of `account`. Caller must be `account` itself, or a
+    ///         factory-approved operator for an `account` that has also opted into
+    ///         `factory.enableAutoMintBurn` (both keys required).
     function mint(address account, uint256 amount) external;
     /// @notice ERC20 transfer override — runs auto-mint / auto-burn hooks; reverts past `exerciseDeadline`.
     function transfer(address to, uint256 amount) external returns (bool);
@@ -129,7 +133,7 @@ interface IOption {
     function exercise(uint256 amount) external;
     /// @notice **Dangerous keeper path.** Burn `amount` of `holder`'s Options; caller pays the
     ///         consideration AND receives the collateral. Holder gets nothing on-chain. Caller must
-    ///         be `holder` or have been authorised via `factory.allowExercise(holder, true)`.
+    ///         be `holder`, or the holder must have granted them `factory.allowExercise(<caller>, true)`.
     /// @return Amount actually exercised (`== amount` on success).
     function exerciseFor(address holder, uint256 amount) external returns (uint256);
     /// @notice Batch variant of {exerciseFor(address,uint256)}. Exercises `amounts[i]` of `holders[i]`
@@ -142,7 +146,8 @@ interface IOption {
     ///         `exerciseDeadline` (boundary inclusive). Caller must hold both sides in equal amount.
     function burn(uint256 amount) external;
     /// @notice Burn `holder`'s expired long tokens (post-`exerciseDeadline` cleanup). Caller must be
-    ///         `holder` or authorised via `factory.allowExercise(holder, true)`. Long side only —
+    ///         `holder`, or the holder must have granted them `factory.allowExercise(<caller>, true)`.
+    ///         Long side only —
     ///         leaves the Receipt and collateral pool untouched. Reverts `NotYetExpired` on or before
     ///         the deadline, `Unauthorized` if the caller lacks the holder's grant.
     function expire(address holder, uint256 amount) external;

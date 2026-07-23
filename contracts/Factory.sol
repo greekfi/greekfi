@@ -101,7 +101,8 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     mapping(address => mapping(address => bool)) private _approvedOperators;
 
     /// @dev Exercise-allowance table: `_exerciseAllowed[holder][operator] -> bool`. Lets `operator`
-    ///      burn `holder`'s options via the on-behalf {Option.exercise} overload.
+    ///      burn `holder`'s options via the on-behalf {Option.exerciseFor} overloads and the
+    ///      post-deadline {Option.expire} dust burn.
     mapping(address => mapping(address => bool)) private _exerciseAllowed;
 
     /// @dev Redeem-allowance table: `_redeemAllowed[holder][redeemer] -> bool`. Lets `redeemer`
@@ -302,10 +303,11 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     ///         underlying `token.approve(factory, ...)` so `safeTransferFrom` can land.
     /// @dev    The allowance fans out to every Receipt clone (gated by the `receipts[]` registry)
     ///         and is consumed by `mint`, `exercise`, and — if {enableAutoMintBurn} is `true` —
-    ///         the auto-mint leg of Option transfers triggered by approved operators. Granting
-    ///         a large allowance here while also holding active {approveOperator} grants with
-    ///         {enableAutoMintBurn} on is functionally equivalent to a permit on the underlying
-    ///         token in favour of those operators.
+    ///         the auto-mint leg of Option transfers (triggered by the holder, an approved
+    ///         operator, or an Option-token ERC-20 spender). Granting a large allowance here
+    ///         while {enableAutoMintBurn} is on is functionally equivalent to a permit on the
+    ///         underlying token in favour of every active operator grant and Option-token
+    ///         approval you hold out.
     /// @param token  ERC20 to be approved.
     /// @param amount Allowance to grant (use `type(uint256).max` for infinite, `0` to revoke).
     function approve(address token, uint256 amount) public nonZeroAddr(token) {
@@ -354,9 +356,10 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     }
 
     /// @notice Authorise `exercisor` to exercise the caller's options on their behalf.
-    /// @dev    Consumed by the on-behalf {Option.exercise(address,uint256)} overloads, which burn
-    ///         the holder's option tokens, pull consideration from `exercisor`, and deliver the
-    ///         collateral to `exercisor`. Distinct from {approveOperator}: that grants transfer
+    /// @dev    Consumed by the on-behalf {Option.exerciseFor} overloads, which burn the holder's
+    ///         option tokens, pull consideration from `exercisor`, and deliver the collateral to
+    ///         `exercisor`; also gates the (harmless) post-deadline {Option.expire} dust burn.
+    ///         Distinct from {approveOperator}: that grants transfer
     ///         authority over the holder's option tokens, this grants the right to *consume* them
     ///         (burn). Defaults to `false`; revoke by passing `allowed = false`.
     /// @param exercisor Account being authorised (must differ from `msg.sender`).
@@ -367,7 +370,8 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
         emit ExerciseApproval(msg.sender, exercisor, allowed);
     }
 
-    /// @notice Is `exercisor` authorised to burn `holder`'s options on their behalf? Set/cleared
+    /// @notice Is `exercisor` authorised to burn `holder`'s options on their behalf (via
+    ///         {Option.exerciseFor} or post-deadline {Option.expire})? Set/cleared
     ///         only via {allowExercise} — independent of {approveOperator}, which grants transfer
     ///         (not burn) authority.
     function exerciseAllowed(address holder, address exercisor) external view returns (bool) {

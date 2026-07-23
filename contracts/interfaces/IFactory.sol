@@ -45,6 +45,10 @@ interface IFactory {
     );
     /// @notice Emitted on {approveOperator}.
     event OperatorApproval(address indexed owner, address indexed operator, bool approved);
+    /// @notice Emitted on {allowExercise}.
+    event ExerciseApproval(address indexed holder, address indexed exercisor, bool allowed);
+    /// @notice Emitted on {allowRedeem}.
+    event RedeemApproval(address indexed holder, address indexed redeemer, bool allowed);
     /// @notice Emitted on {enableAutoMintBurn}.
     event AutoMintBurnUpdated(address indexed account, bool enabled);
     /// @notice Emitted on {approve} (factory-level allowance set).
@@ -54,6 +58,8 @@ interface IFactory {
     error InvalidAddress();
     /// @notice Collateral and consideration were the same address.
     error InvalidTokens();
+    /// @notice A value param (strike, expiration, window, decimals) is invalid.
+    error InvalidValue();
     /// @notice Token transferFrom delivered less than `amount` — fee-on-transfer / rebasing tokens are not supported.
     error FeeOnTransferNotSupported();
 
@@ -80,7 +86,8 @@ interface IFactory {
     function autoMintBurn(address account) external view returns (bool);
     /// @notice `true` if `operator` has blanket authority over `owner`'s Option tokens.
     function approvedOperator(address owner, address operator) external view returns (bool);
-    /// @notice `true` if `exercisor` may burn `holder`'s options via `exerciseFor`.
+    /// @notice `true` if `exercisor` may burn `holder`'s options via `Option.exerciseFor` or the
+    ///         post-deadline `Option.expire` dust burn.
     function exerciseAllowed(address holder, address exercisor) external view returns (bool);
     /// @notice `true` if `redeemer` may trigger `Receipt.redeemFor` on behalf of `holder`.
     function redeemAllowed(address holder, address redeemer) external view returns (bool);
@@ -90,7 +97,8 @@ interface IFactory {
     function createOption(CreateParams memory params) external returns (address);
     /// @notice Batch form of {createOption}.
     function createOptions(CreateParams[] memory params) external returns (address[] memory);
-    /// @notice Pull tokens via the factory-level allowance. Only callable by Collateral clones.
+    /// @notice Pull tokens via the factory-level allowance. Only callable by Receipt clones this
+    ///         factory created (`receipts[msg.sender]`).
     function transferFrom(address from, address to, uint256 amount, address token) external returns (bool success);
     /// @notice Set the caller's factory-level allowance for `token`.
     function approve(address token, uint256 amount) external;
@@ -98,7 +106,8 @@ interface IFactory {
     function enableAutoMintBurn(bool enabled) external;
     /// @notice Grant / revoke blanket operator authority over the caller's options.
     function approveOperator(address operator, bool approved) external;
-    /// @notice Authorise / revoke `exercisor` for `Option.exerciseFor` on the caller's options.
+    /// @notice Authorise / revoke `exercisor` for `Option.exerciseFor` / `Option.expire` on the
+    ///         caller's options.
     function allowExercise(address exercisor, bool allowed) external;
     /// @notice Authorise / revoke `redeemer` for `Receipt.redeemFor` on the caller's receipts.
     function allowRedeem(address redeemer, bool allowed) external;

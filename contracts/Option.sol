@@ -10,8 +10,9 @@ import { Receipt } from "./Receipt.sol";
 import { TokenData, Balances, OptionInfo } from "./interfaces/IOption.sol";
 import { OptionUtils } from "./OptionUtils.sol";
 
-/// @dev Narrow view of {Factory} used by {Option} for auto-mint/auto-burn lookups
-///      and operator (ERC1155-style blanket allowance) checks on transfers.
+/// @dev Narrow view of {Factory} used by {Option} for auto-mint/auto-burn lookups, operator
+///      (ERC1155-style blanket allowance) checks on transfers and mint-on-behalf, and
+///      exercise/expire authorisation.
 interface IFactory {
     function approvedOperator(address owner, address operator) external view returns (bool);
     function autoMintBurn(address account) external view returns (bool);
@@ -33,13 +34,15 @@ interface IFactory {
  *         | American  | `false`  | allowed             | allowed            | short pro-rata   |
  *         | European  | `true`   | reverts             | allowed            | short pro-rata   |
  *
- *         The exercise window is `[expirationDate, exerciseDeadline)` where
- *         `exerciseDeadline = expirationDate + windowSeconds` (default 8 hours, settable per
- *         option). The holder decides off-chain whether ITM is profitable and pays strike to
- *         exercise; the protocol just enforces timing and the 1:1 collateral invariant.
- *         Pair `burn` (matched long+short burn) is available **pre-expiration only**: once the
- *         option enters settlement, the only exits are `exercise` (window) and pro-rata `redeem`
- *         (post-window).
+ *         The exercise window is `[expirationDate, exerciseDeadline]` (deadline inclusive) where
+ *         `exerciseDeadline = expirationDate + windowSeconds`. `windowSeconds` is set per option
+ *         at creation and taken literally — the contract applies no default
+ *         ({Factory.DEFAULT_EXERCISE_WINDOW} = 8 hours is informational, for frontends). The
+ *         holder decides off-chain whether ITM is profitable and pays strike to exercise; the
+ *         protocol just enforces timing and the 1:1 collateral invariant.
+ *         Pair `burn` (matched long+short burn) is available up to and including
+ *         `exerciseDeadline`; once the window closes, the remaining exits are pro-rata `redeem`
+ *         (short side) and `expire` (long-side dust burn).
  *
  *         ### Auto-mint / auto-burn
  *
@@ -86,10 +89,11 @@ contract Option is ERC20, ReentrancyGuardTransient {
     /// @param amount      Collateral units delivered (consideration paid is `toConsideration(amount, true)`, ceil).
     event Exercise(address longOption, address caller, address holder, uint256 amount);
 
-    /// @notice Emitted when a holder burns expired (post-deadline) long option tokens via {expire}.
+    /// @notice Emitted when expired (post-deadline) long option tokens are burned via {expire}.
     /// @param longOption  The Option contract (always `address(this)`).
-    /// @param caller      The account that initiated the expiration (always the holder).
-    /// @param holder      The account whose options were burned (== `caller`).
+    /// @param caller      The account that initiated the expiration — the holder themselves, or a
+    ///                    keeper the holder authorised via `factory.allowExercise`.
+    /// @param holder      The account whose options were burned.
     /// @param amount      Amount of options burned.
     event Expire(address longOption, address caller, address holder, uint256 amount);
 
@@ -338,11 +342,12 @@ contract Option is ERC20, ReentrancyGuardTransient {
     ///             flash loan with the consideration cost, and pays the holder the spread), or
     ///         (b) the holder explicitly intends to gift the exercise value to `msg.sender`.
     ///
-    ///         Authorisation: `msg.sender` must be `holder` themselves or have been authorised
-    ///         via `factory.allowExercise(msg.sender, true)`. **Authorising a non-trusted
+    ///         Authorisation: `msg.sender` must be `holder` themselves, or the holder must have
+    ///         granted them `factory.allowExercise(<caller>, true)`. **Authorising a non-trusted
     ///         exercisor is equivalent to giving them a withdrawal right over your ITM value.**
-    ///         `factory.approveOperator` does NOT grant exercise rights — it gates ERC20
-    ///         transfer of option tokens only.
+    ///         `factory.approveOperator` does NOT grant exercise rights — it gates transfer of
+    ///         option tokens (and, combined with the holder's auto-mint opt-in, mint-on-behalf),
+    ///         never exercise.
     ///
     ///         Allowed any time exercise itself is allowed (pre-expiry for American, plus the
     ///         post-expiry window for both flavours).
@@ -455,7 +460,8 @@ contract Option is ERC20, ReentrancyGuardTransient {
     ///         `Receipt`, so it has no effect on the redemption pool or the solvency invariant
     ///         (short-side collateral is recovered separately via `Receipt.redeem`). Reverts with
     ///         `NotYetExpired` on or before the deadline — use {burn} or {exercise} while live.
-    ///         Caller must be `holder` or authorised via `factory.allowExercise(holder, true)`
+    ///         Caller must be `holder`, or the holder must have granted them
+    ///         `factory.allowExercise(<caller>, true)`
     ///         (reverts `Unauthorized` otherwise); unlike {exerciseFor} this is harmless — the
     ///         tokens are already worthless, so a keeper gains nothing by burning them.
     /// @param holder Address of the long option holder.
