@@ -232,13 +232,20 @@ contract Option is ERC20, ReentrancyGuardTransient {
     }
 
     /// @notice Mint `amount` option tokens to `account`. Collateral is pulled from `account` via
-    ///         the factory's centralised allowance, so the caller must be `account` itself or a
-    ///         factory-approved operator for `account` — otherwise any address holding a non-zero
-    ///         factory allowance could be force-minted into unwanted positions.
+    ///         the factory's centralised allowance, so the caller must be `account` itself, or a
+    ///         factory-approved operator for `account` where `account` has also opted into
+    ///         auto-mint — otherwise any address holding a non-zero factory allowance could be
+    ///         force-minted into unwanted positions.
     /// @param account Recipient of both `Option` and `Receipt` tokens. Pays the collateral.
     /// @param amount  Collateral-denominated mint amount.
     function mint(address account, uint256 amount) public nonReentrant {
-        if (msg.sender != account && !FACTORY.approvedOperator(account, msg.sender)) revert Unauthorized();
+        // Minting on behalf of `account` requires BOTH an operator grant AND the holder's auto-mint
+        // opt-in — the documented "combination danger". An operator grant alone is intentionally not
+        // sufficient: without this, an approved operator could pull the holder's entire factory
+        // collateral allowance (into an attacker-chosen market) with no auto-mint opt-in from the holder.
+        if (msg.sender != account && !(FACTORY.approvedOperator(account, msg.sender) && FACTORY.autoMintBurn(account))) {
+            revert Unauthorized();
+        }
         mint_(account, amount);
     }
 
