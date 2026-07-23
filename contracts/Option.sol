@@ -263,14 +263,20 @@ contract Option is ERC20, ReentrancyGuardTransient {
     ///      Not an override of OZ's `_transfer` (which is non-virtual) — callable from the public
     ///      transfer paths only, so mint/burn don't trigger it.
     ///
-    ///      **⚠ Operator-mint surface.** The auto-mint branch keys on `from`'s opt-in flag, not on
-    ///      whether `msg.sender == from`. When `from` has both granted `factory.approveOperator`
-    ///      to some operator AND opted into `factory.enableAutoMintBurn`, the operator can call
+    ///      **⚠ Spender-mint surface (intentional).** The auto-mint branch keys on `from`'s opt-in
+    ///      flag, not on whether `msg.sender == from`. It is reachable by ANY caller authorised to
+    ///      move `from`'s tokens — `from` itself, a factory-approved operator, or a plain ERC-20
+    ///      spender with sufficient allowance on this option token ({transferFrom} spends the
+    ///      allowance first, then lands here). Operator grants and ERC-20 allowances are
+    ///      deliberately equal-power credentials: once `from` has opted into
+    ///      `factory.enableAutoMintBurn`, either one can call
     ///      `Option.transferFrom(from, recipient, amount)` for an amount `from` doesn't currently
     ///      hold — auto-mint then pulls `from`'s factory collateral allowance to manufacture the
-    ///      missing balance. Combined, the two grants are equivalent to a permit on `from`'s
-    ///      collateral. The Factory NatSpec on {approveOperator} and {enableAutoMintBurn} warns
-    ///      about this loudly; the surface lives here.
+    ///      missing balance. Combined with the opt-in, each credential is a permit on `from`'s
+    ///      collateral: unbounded and protocol-wide for an operator, capped at the approved amount
+    ///      for an ERC-20 spender (`type(uint256).max` approvals remove the cap). The Factory
+    ///      NatSpec on {approveOperator} and {enableAutoMintBurn} warns about this loudly; the
+    ///      surface lives here.
     function _settledTransfer(address from, address to, uint256 value) internal {
         uint256 balance = balanceOf(from);
         if (balance < value) {

@@ -322,15 +322,20 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     ///         part of a settlement flow without requiring a per-option ERC20 `approve`. Approved
     ///         operators skip the per-transfer `_spendAllowance` step on {Option.transferFrom}.
     ///
+    ///         An operator grant is deliberately equal in power to a per-option ERC-20 allowance
+    ///         on the Option token — it differs only in scope: unbounded amount, every option pair
+    ///         at once, and no `_spendAllowance` bookkeeping.
+    ///
     ///         **⚠ Combination danger.** If the holder has also called {enableAutoMintBurn(true)},
     ///         an approved operator gains the right to *mint new Option positions* against the
     ///         holder's factory collateral allowance, not just move existing balance. Path:
     ///         operator calls `Option.transferFrom(holder, recipient, amount)` for an amount the
     ///         holder doesn't currently hold → auto-mint pulls collateral via `factory.transferFrom`
     ///         → minted Option lands at `recipient`. Functionally this combination is a permit on
-    ///         collateral. Only grant {approveOperator} to entities you trust to also have
-    ///         minting rights over your collateral allowance — i.e. audited protocol contracts,
-    ///         never EOAs and never unaudited integrations.
+    ///         collateral. The same promotion applies to plain ERC-20 spenders on the Option token
+    ///         (capped at their allowance) — see {enableAutoMintBurn}. Only grant {approveOperator}
+    ///         to entities you trust to also have minting rights over your collateral allowance —
+    ///         i.e. audited protocol contracts, never EOAs and never unaudited integrations.
     ///
     ///         {approveOperator} does NOT grant exercise rights ({allowExercise} is separate) and
     ///         does NOT grant redeem rights ({allowRedeem} is separate). Defaults to `false`;
@@ -397,12 +402,17 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     ///           holds the matching Receipt, the incoming Option is immediately pair-burned and
     ///           collateral is returned (avoids dangling matched positions).
     ///
-    ///         **⚠ Combination danger.** When combined with {approveOperator}, this flag promotes
-    ///         the operator's transfer right into a *minting* right against the holder's factory
-    ///         collateral allowance — see the warning on {approveOperator}. The flag is per-account
-    ///         and applies to every option pair this factory has created. Treat it like a permit:
-    ///         enable it only while you have collateral approvals out to operators you trust to
-    ///         also have minting rights over those approvals.
+    ///         **⚠ Combination danger.** This flag promotes *every* transfer right anyone holds
+    ///         over your Option tokens into a *minting* right against your factory collateral
+    ///         allowance. That covers factory-approved operators (unbounded — see the warning on
+    ///         {approveOperator}) AND plain ERC-20 approvals on any Option token (e.g. to a DEX
+    ///         router), each up to its approved amount — an allowance of `type(uint256).max` is
+    ///         effectively unbounded. Approving an Option token while this flag is on does not just
+    ///         let the spender take options you hold; it lets them pull your collateral to mint
+    ///         options you don't. The flag is per-account and applies to every option pair this
+    ///         factory has created. Treat it like a permit: enable it only while every outstanding
+    ///         Option-token approval and operator grant is one you trust to also have minting
+    ///         rights over your collateral, and prefer finite approvals to cap the exposure.
     ///
     ///         Defaults to `false`; revoke by passing `enabled = false`.
     /// @param enabled `true` to opt in, `false` to opt out.
