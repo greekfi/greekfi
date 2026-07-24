@@ -29,7 +29,8 @@ struct CreateParams {
 /// @title  IFactory — option pair deployer + allowance hub
 /// @author Greek.fi
 /// @notice Deploys Option + Receipt pairs via EIP-1167 clones, serves as the single ERC20 approval
-///         point for every option pair it creates, and holds an operator + auto-mint-redeem registry.
+///         point for every option pair it creates, and holds the per-(owner, operator)
+///         permission registry ({Perm} bitmasks: TRANSFER / MINT / BURN / REDEEM / EXERCISE).
 interface IFactory {
     /// @notice Emitted for every newly-created option.
     event OptionCreated(
@@ -43,10 +44,9 @@ interface IFactory {
         address indexed option,
         address receipt
     );
-    /// @notice Emitted on {approveOperator}.
-    event OperatorApproval(address indexed owner, address indexed operator, bool approved);
-    /// @notice Emitted on {enableAutoMintBurn}.
-    event AutoMintBurnUpdated(address indexed account, bool enabled);
+    /// @notice Emitted whenever `owner`'s permission mask for `operator` changes ({setPermissions}
+    ///         / {addPermissions}). `mask` is the full resulting mask, not a delta.
+    event PermissionsUpdated(address indexed owner, address indexed operator, uint256 mask);
     /// @notice Emitted on {approve} (factory-level allowance set).
     event Approval(address indexed token, address indexed owner, uint256 amount);
 
@@ -54,6 +54,8 @@ interface IFactory {
     error InvalidAddress();
     /// @notice Collateral and consideration were the same address.
     error InvalidTokens();
+    /// @notice A value param (strike, expiration, window, decimals, permission mask) is invalid.
+    error InvalidValue();
     /// @notice Token transferFrom delivered less than `amount` — fee-on-transfer / rebasing tokens are not supported.
     error FeeOnTransferNotSupported();
 
@@ -76,14 +78,13 @@ interface IFactory {
     function optionKey(CreateParams memory p) external pure returns (bytes32);
     /// @notice Factory-level allowance: how much of `token` the factory may pull from `owner`.
     function allowance(address token, address owner) external view returns (uint256);
-    /// @notice `true` if `account` has opted into Option's auto-mint / auto-redeem transfer hooks.
-    function autoMintBurn(address account) external view returns (bool);
-    /// @notice `true` if `operator` has blanket authority over `owner`'s Option tokens.
-    function approvedOperator(address owner, address operator) external view returns (bool);
-    /// @notice `true` if `exercisor` may burn `holder`'s options via `exerciseFor`.
-    function exerciseAllowed(address holder, address exercisor) external view returns (bool);
-    /// @notice `true` if `redeemer` may trigger `Receipt.redeemFor` on behalf of `holder`.
-    function redeemAllowed(address holder, address redeemer) external view returns (bool);
+    /// @notice `operator`'s permission bitmask over `owner`'s positions — see {Perm}: TRANSFER (1),
+    ///         MINT (2), BURN (4), REDEEM (8), EXERCISE (16). The self entry
+    ///         `permissions(account, account)` carries the account's automation opt-ins
+    ///         (MINT = auto-mint on shortfall, BURN = auto-burn on receive).
+    function permissions(address owner, address operator) external view returns (uint256);
+    /// @notice `true` if `operator` holds every bit of `mask` in `owner`'s grant.
+    function hasPermissions(address owner, address operator, uint256 mask) external view returns (bool);
 
     /// @notice Create a new Option + Receipt pair per the given parameters, or return the existing
     ///         canonical Option if one with economically-identical params already exists (get-or-create).
@@ -94,12 +95,10 @@ interface IFactory {
     function transferFrom(address from, address to, uint256 amount, address token) external returns (bool success);
     /// @notice Set the caller's factory-level allowance for `token`.
     function approve(address token, uint256 amount) external;
-    /// @notice Opt-in / opt-out of Option's auto-mint-on-transfer / auto-redeem-on-receive behaviour.
-    function enableAutoMintBurn(bool enabled) external;
-    /// @notice Grant / revoke blanket operator authority over the caller's options.
-    function approveOperator(address operator, bool approved) external;
-    /// @notice Authorise / revoke `exercisor` for `Option.exerciseFor` on the caller's options.
-    function allowExercise(address exercisor, bool allowed) external;
-    /// @notice Authorise / revoke `redeemer` for `Receipt.redeemFor` on the caller's receipts.
-    function allowRedeem(address redeemer, bool allowed) external;
+    /// @notice Set `operator`'s permission mask over the caller's positions, overwriting any
+    ///         previous mask (`0` revokes everything). Reverts on bits outside `Perm.ALL`.
+    ///         `operator == msg.sender` sets the caller's own automation opt-ins.
+    function setPermissions(address operator, uint256 mask) external;
+    /// @notice OR `mask` into `operator`'s existing permission mask (adds bits, never removes).
+    function addPermissions(address operator, uint256 mask) external;
 }

@@ -13,29 +13,29 @@ import { Option } from "./Option.sol";
 import { Receipt } from "./Receipt.sol";
 import { ClonesWithImmutableArgs } from "clone/src/ClonesWithImmutableArgs.sol";
 import { CreateParams } from "./interfaces/IFactory.sol";
+import { Perm } from "./Permissions.sol";
 
 using SafeERC20 for IERC20;
 
 /**
- * @title  Factory — deployer, allowance hub, operator registry
+ * @title  Factory — deployer, allowance hub, permission registry
  * @author Greek.fi
  * @notice The only on-chain contract users need to interact with to *create* options. Once deployed,
  *         every Option + Receipt pair runs off pre-compiled template clones, so creation is
  *         cheap and the factory is never an upgradeable rug vector (the templates are immutable).
  *
- *         The factory also plays three lasting roles post-creation:
+ *         The factory also plays two lasting roles post-creation:
  *
  *         1. **Single allowance point.** Users `approve(collateralToken, amount)` on the factory once,
  *            and any Option / Receipt pair created by this factory can pull from that allowance
  *            via {transferFrom}. No need to approve every new option individually.
  *
- *         2. **Operator registry.** {approveOperator} gives an address blanket authority to move
- *            any Option produced by this factory on your behalf — the ERC-1155-style "setApprovalForAll"
- *            pattern. Used by trading venues and aggregators.
- *
- *         3. **Auto-mint / auto-redeem opt-in.** {enableAutoMintBurn} flips a per-account flag that
- *            Option consults on transfer to auto-mint deficits and auto-redeem matched Option+Receipt
- *            on the receiving side.
+ *         2. **Permission registry.** {setPermissions} / {addPermissions} maintain a per-
+ *            (owner, operator) bitmask of {Perm} flags — TRANSFER, MINT, BURN, REDEEM, EXERCISE —
+ *            covering every option this factory has created. One row replaces the ERC-1155-style
+ *            "setApprovalForAll" plus per-action allowances. The self entry
+ *            `permissions[account][account]` holds the account's own automation opt-ins:
+ *            MINT = auto-mint on transfer shortfall, BURN = auto-burn on receive.
  *
  *         ### Exercise window
  *
@@ -97,22 +97,13 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     /// @dev Per-token allowance table: `_allowances[token][owner] -> amount`.
     mapping(address => mapping(address => uint256)) private _allowances;
 
-    /// @dev Operator approval table: `_approvedOperators[owner][operator] -> bool`.
-    mapping(address => mapping(address => bool)) private _approvedOperators;
-
-    /// @dev Exercise-allowance table: `_exerciseAllowed[holder][operator] -> bool`. Lets `operator`
-    ///      burn `holder`'s options via the on-behalf {Option.exercise} overload.
-    mapping(address => mapping(address => bool)) private _exerciseAllowed;
-
-    /// @dev Redeem-allowance table: `_redeemAllowed[holder][redeemer] -> bool`. Lets `redeemer`
-    ///      trigger {Receipt.redeemFor} on `holder`'s post-window position. Funds always go to
-    ///      the holder — the redeemer is a pure trigger. Composability-safe: a Receipt sitting
-    ///      inside an ERC4626 vault / Morpho market / multisig cannot be force-unwound by an
-    ///      unauthorised third party.
-    mapping(address => mapping(address => bool)) private _redeemAllowed;
-
-    /// @notice Per-account opt-in for auto-mint on transfer and auto-redeem on receive in {Option}.
-    mapping(address => bool) public autoMintBurn;
+    /// @notice Permission table: `permissions[owner][operator] -> bitmask` of {Perm} flags.
+    ///         One row per (owner, operator) pair covering every option this factory created:
+    ///         TRANSFER (1), MINT (2), BURN (4), REDEEM (8), EXERCISE (16). The self entry
+    ///         `permissions[account][account]` holds the account's own automation opt-ins
+    ///         (MINT = auto-mint on shortfall, BURN = auto-burn on receive). See {Perm} for
+    ///         the full semantics and risk notes per bit.
+    mapping(address => mapping(address => uint256)) public permissions;
 
     /// @notice Thrown when a zero address is supplied where a real contract is required.
     error InvalidAddress();
@@ -144,14 +135,9 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
         address indexed option,
         address receipt
     );
-    /// @notice Emitted on {approveOperator}.
-    event OperatorApproval(address indexed owner, address indexed operator, bool approved);
-    /// @notice Emitted on {allowExercise}.
-    event ExerciseApproval(address indexed holder, address indexed exercisor, bool allowed);
-    /// @notice Emitted on {allowRedeem}.
-    event RedeemApproval(address indexed holder, address indexed redeemer, bool allowed);
-    /// @notice Emitted on {enableAutoMintBurn}.
-    event AutoMintBurnUpdated(address indexed account, bool enabled);
+    /// @notice Emitted whenever `owner`'s permission mask for `operator` changes ({setPermissions}
+    ///         / {addPermissions}). `mask` is the full resulting mask, not a delta.
+    event PermissionsUpdated(address indexed owner, address indexed operator, uint256 mask);
     /// @notice Emitted on {approve} (factory-level allowance set by token owner).
     event Approval(address indexed token, address indexed owner, uint256 amount);
 
@@ -313,101 +299,46 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
         emit Approval(token, msg.sender, amount);
     }
 
-    // ============ OPERATOR APPROVAL ============
+    // ============ PERMISSIONS ============
 
-    /// @notice Grant or revoke `operator` blanket authority to move any of the caller's Option tokens
-    ///         across every option this factory has created (ERC-1155-style `setApprovalForAll`).
-    /// @dev    **Intended for audited swap / trading-venue contracts** — Uniswap-style routers,
-    ///         RFQ market makers, vault adapters, anything that needs to pull a holder's Option as
-    ///         part of a settlement flow without requiring a per-option ERC20 `approve`. Approved
-    ///         operators skip the per-transfer `_spendAllowance` step on {Option.transferFrom}.
+    /// @notice Set `operator`'s permission mask over the caller's positions, overwriting any
+    ///         previous mask. `0` revokes everything. Bits: `Perm.TRANSFER` (1), `Perm.MINT` (2),
+    ///         `Perm.BURN` (4), `Perm.REDEEM` (8), `Perm.EXERCISE` (16) — see {Perm} for what each
+    ///         bit authorises and its risk profile.
+    /// @dev    **Intended for audited swap / keeper / vault contracts.** Each bit is an independent
+    ///         grant; nothing is implied by another bit. In particular:
+    ///         - `MINT` lets the operator pull the caller's factory collateral allowance to mint
+    ///           new positions — functionally a permit on collateral. Never grant to EOAs or
+    ///           unaudited integrations.
+    ///         - `EXERCISE` lets the operator burn the caller's options, pay the consideration and
+    ///           keep the collateral — a withdrawal right over the caller's ITM value.
+    ///         - `TRANSFER` only moves existing balance; `BURN` / `REDEEM` are pure triggers whose
+    ///           proceeds always return to the caller.
     ///
-    ///         **⚠ Combination danger.** If the holder has also called {enableAutoMintBurn(true)},
-    ///         an approved operator gains the right to *mint new Option positions* against the
-    ///         holder's factory collateral allowance, not just move existing balance. Path:
-    ///         operator calls `Option.transferFrom(holder, recipient, amount)` for an amount the
-    ///         holder doesn't currently hold → auto-mint pulls collateral via `factory.transferFrom`
-    ///         → minted Option lands at `recipient`. Functionally this combination is a permit on
-    ///         collateral. Only grant {approveOperator} to entities you trust to also have
-    ///         minting rights over your collateral allowance — i.e. audited protocol contracts,
-    ///         never EOAs and never unaudited integrations.
-    ///
-    ///         {approveOperator} does NOT grant exercise rights ({allowExercise} is separate) and
-    ///         does NOT grant redeem rights ({allowRedeem} is separate). Defaults to `false`;
-    ///         revoke by passing `approved = false`.
-    /// @param operator Address being approved/revoked (must differ from `msg.sender`).
-    /// @param approved `true` to grant, `false` to revoke.
-    function approveOperator(address operator, bool approved) external nonZeroAddr(operator) {
-        if (operator == msg.sender) revert InvalidAddress();
-        _approvedOperators[msg.sender][operator] = approved;
-        emit OperatorApproval(msg.sender, operator, approved);
+    ///         `operator == msg.sender` is the **self entry**: `MINT` opts into auto-mint on
+    ///         transfer shortfall, `BURN` opts into auto-burn on receive (see {Perm}); the other
+    ///         bits are meaningless on self (self action is always allowed directly).
+    /// @param operator Address being granted (or, for the caller's own address, the automation opt-in).
+    /// @param mask     Full replacement mask; must not contain bits outside `Perm.ALL`.
+    function setPermissions(address operator, uint256 mask) external nonZeroAddr(operator) {
+        if (mask & ~Perm.ALL != 0) revert InvalidValue();
+        permissions[msg.sender][operator] = mask;
+        emit PermissionsUpdated(msg.sender, operator, mask);
     }
 
-    /// @notice Is `operator` an approved operator for `owner_`?
-    function approvedOperator(address owner_, address operator) external view returns (bool) {
-        return _approvedOperators[owner_][operator];
+    /// @notice OR `mask` into `operator`'s existing permission mask (adds bits, never removes).
+    ///         Use {setPermissions} to remove bits or revoke outright.
+    /// @param operator Address being granted.
+    /// @param mask     Bits to add; must not contain bits outside `Perm.ALL`.
+    function addPermissions(address operator, uint256 mask) external nonZeroAddr(operator) {
+        if (mask & ~Perm.ALL != 0) revert InvalidValue();
+        uint256 updated = permissions[msg.sender][operator] | mask;
+        permissions[msg.sender][operator] = updated;
+        emit PermissionsUpdated(msg.sender, operator, updated);
     }
 
-    /// @notice Authorise `exercisor` to exercise the caller's options on their behalf.
-    /// @dev    Consumed by the on-behalf {Option.exercise(address,uint256)} overloads, which burn
-    ///         the holder's option tokens, pull consideration from `exercisor`, and deliver the
-    ///         collateral to `exercisor`. Distinct from {approveOperator}: that grants transfer
-    ///         authority over the holder's option tokens, this grants the right to *consume* them
-    ///         (burn). Defaults to `false`; revoke by passing `allowed = false`.
-    /// @param exercisor Account being authorised (must differ from `msg.sender`).
-    /// @param allowed   `true` to grant, `false` to revoke.
-    function allowExercise(address exercisor, bool allowed) external nonZeroAddr(exercisor) {
-        if (exercisor == msg.sender) revert InvalidAddress();
-        _exerciseAllowed[msg.sender][exercisor] = allowed;
-        emit ExerciseApproval(msg.sender, exercisor, allowed);
-    }
-
-    /// @notice Is `exercisor` authorised to burn `holder`'s options on their behalf? Set/cleared
-    ///         only via {allowExercise} — independent of {approveOperator}, which grants transfer
-    ///         (not burn) authority.
-    function exerciseAllowed(address holder, address exercisor) external view returns (bool) {
-        return _exerciseAllowed[holder][exercisor];
-    }
-
-    /// @notice Authorise `redeemer` to trigger post-window pro-rata redeem on the caller's behalf
-    ///         via {Receipt.redeemFor}.
-    /// @dev    Unlike {allowExercise}, this grant carries no value-extraction risk: the redeemer
-    ///         can only burn the holder's receipts; the collateral / consideration payout always
-    ///         goes to the holder. Use this to wire a keeper that sweeps dust post-window, or to
-    ///         let a vault-management contract unwind its own positions via a worker.
-    /// @param redeemer Account being authorised (must differ from `msg.sender`).
-    /// @param allowed  `true` to grant, `false` to revoke.
-    function allowRedeem(address redeemer, bool allowed) external nonZeroAddr(redeemer) {
-        if (redeemer == msg.sender) revert InvalidAddress();
-        _redeemAllowed[msg.sender][redeemer] = allowed;
-        emit RedeemApproval(msg.sender, redeemer, allowed);
-    }
-
-    /// @notice Is `redeemer` authorised to trigger {Receipt.redeemFor} on behalf of `holder`?
-    function redeemAllowed(address holder, address redeemer) external view returns (bool) {
-        return _redeemAllowed[holder][redeemer];
-    }
-
-    /// @notice Opt in to {Option}'s auto-mint-on-send and auto-redeem-on-receive transfer behaviour.
-    /// @dev    Quality-of-life flag for active holders. When `true`:
-    ///         - On `Option.transfer` / `transferFrom` *from* the holder where balance is short,
-    ///           the missing amount is auto-minted by pulling collateral via the factory's
-    ///           allowance registry (saves a separate `mint` tx before sending).
-    ///         - On `Option.transfer` / `transferFrom` *to* the holder where the holder already
-    ///           holds the matching Receipt, the incoming Option is immediately pair-burned and
-    ///           collateral is returned (avoids dangling matched positions).
-    ///
-    ///         **⚠ Combination danger.** When combined with {approveOperator}, this flag promotes
-    ///         the operator's transfer right into a *minting* right against the holder's factory
-    ///         collateral allowance — see the warning on {approveOperator}. The flag is per-account
-    ///         and applies to every option pair this factory has created. Treat it like a permit:
-    ///         enable it only while you have collateral approvals out to operators you trust to
-    ///         also have minting rights over those approvals.
-    ///
-    ///         Defaults to `false`; revoke by passing `enabled = false`.
-    /// @param enabled `true` to opt in, `false` to opt out.
-    function enableAutoMintBurn(bool enabled) external {
-        autoMintBurn[msg.sender] = enabled;
-        emit AutoMintBurnUpdated(msg.sender, enabled);
+    /// @notice `true` if `operator` holds every bit of `mask` in `owner_`'s grant.
+    function hasPermissions(address owner_, address operator, uint256 mask) external view returns (bool) {
+        return permissions[owner_][operator] & mask == mask;
     }
 }

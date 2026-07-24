@@ -9,13 +9,13 @@ import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { Receipt } from "./Receipt.sol";
 import { TokenData, Balances, OptionInfo } from "./interfaces/IOption.sol";
 import { OptionUtils } from "./OptionUtils.sol";
+import { Perm } from "./Permissions.sol";
 
-/// @dev Narrow view of {Factory} used by {Option} for auto-mint/auto-burn lookups
-///      and operator (ERC1155-style blanket allowance) checks on transfers.
+/// @dev Narrow view of {Factory} used by {Option} for permission-mask lookups on transfer,
+///      mint, burn and exercise paths. The mask is a bitfield of {Perm} flags; the self entry
+///      `permissions(account, account)` carries the account's auto-mint / auto-burn opt-ins.
 interface IFactory {
-    function approvedOperator(address owner, address operator) external view returns (bool);
-    function autoMintBurn(address account) external view returns (bool);
-    function exerciseAllowed(address holder, address exercisor) external view returns (bool);
+    function permissions(address owner, address operator) external view returns (uint256);
 }
 
 /**
@@ -43,8 +43,9 @@ interface IFactory {
  *
  *         ### Auto-mint / auto-burn
  *
- *         Addresses that have opted in via `factory.enableAutoMintBurn(true)` get two
- *         transfer-time conveniences:
+ *         Addresses that have opted in via their self entry in the factory permission table
+ *         (`factory.setPermissions(self, Perm.MINT | Perm.BURN)`) get two transfer-time
+ *         conveniences:
  *
  *         - **Auto-mint** — if the sender tries to transfer more `Option` than they hold,
  *           the contract pulls enough collateral from the sender and mints the deficit.
@@ -232,13 +233,18 @@ contract Option is ERC20, ReentrancyGuardTransient {
     }
 
     /// @notice Mint `amount` option tokens to `account`. Collateral is pulled from `account` via
-    ///         the factory's centralised allowance, so the caller must be `account` itself or a
-    ///         factory-approved operator for `account` — otherwise any address holding a non-zero
-    ///         factory allowance could be force-minted into unwanted positions.
+    ///         the factory's centralised allowance, so the caller must be `account` itself or hold
+    ///         `Perm.MINT` in `account`'s factory permission mask — otherwise any address holding
+    ///         a non-zero factory allowance could be force-minted into unwanted positions.
+    /// @dev    `Perm.MINT` is an explicit, single-purpose grant: it lets the operator pull the
+    ///         holder's factory collateral allowance into new positions (functionally a permit on
+    ///         collateral). It is NOT implied by `Perm.TRANSFER` or any other bit.
     /// @param account Recipient of both `Option` and `Receipt` tokens. Pays the collateral.
     /// @param amount  Collateral-denominated mint amount.
     function mint(address account, uint256 amount) public nonReentrant {
-        if (msg.sender != account && !FACTORY.approvedOperator(account, msg.sender)) revert Unauthorized();
+        if (msg.sender != account && FACTORY.permissions(account, msg.sender) & Perm.MINT == 0) {
+            revert Unauthorized();
+        }
         mint_(account, amount);
     }
 
@@ -252,28 +258,36 @@ contract Option is ERC20, ReentrancyGuardTransient {
     // ============ TRANSFER (auto-mint + auto-burn) ============
 
     /// @dev Auto-mint (sender) + auto-burn (receiver) hook around the underlying ERC20 transfer.
-    ///      Both legs are gated on each party's `autoMintBurn` opt-in held on the factory.
+    ///      Both legs are gated on {Perm} bits held on the factory: MINT for the sender's
+    ///      auto-mint leg, the receiver's self BURN bit for the auto-burn leg.
     ///      Not an override of OZ's `_transfer` (which is non-virtual) — callable from the public
     ///      transfer paths only, so mint/burn don't trigger it.
     ///
-    ///      **⚠ Operator-mint surface.** The auto-mint branch keys on `from`'s opt-in flag, not on
-    ///      whether `msg.sender == from`. When `from` has both granted `factory.approveOperator`
-    ///      to some operator AND opted into `factory.enableAutoMintBurn`, the operator can call
-    ///      `Option.transferFrom(from, recipient, amount)` for an amount `from` doesn't currently
-    ///      hold — auto-mint then pulls `from`'s factory collateral allowance to manufacture the
-    ///      missing balance. Combined, the two grants are equivalent to a permit on `from`'s
-    ///      collateral. The Factory NatSpec on {approveOperator} and {enableAutoMintBurn} warns
-    ///      about this loudly; the surface lives here.
+    ///      **⚠ Operator-mint surface.** The auto-mint branch requires `Perm.MINT` in
+    ///      `permissions(from, msg.sender)` — the self entry when `from` sends their own tokens
+    ///      (the holder's auto-mint opt-in), the operator's explicit MINT grant otherwise.
+    ///      A bare ERC-20 spender (plain `approve` on this option token) can never reach auto-mint:
+    ///      a dangling option-token allowance spends existing balance only, it is not a claim on
+    ///      `from`'s collateral. An operator holding `Perm.MINT` can transfer amounts `from`
+    ///      doesn't hold — auto-mint pulls `from`'s collateral allowance to manufacture the
+    ///      missing balance, which is why {Perm} documents MINT as a permit on collateral.
+    ///
+    ///      The auto-burn leg keys on the **receiver's self entry** (`Perm.BURN` on
+    ///      `permissions(to, to)`) — it is the receiving account's own opt-in, independent of
+    ///      whoever initiated the transfer.
     function _settledTransfer(address from, address to, uint256 value) internal {
         uint256 balance = balanceOf(from);
         if (balance < value) {
-            if (!FACTORY.autoMintBurn(from)) revert ERC20InsufficientBalance(from, balance, value);
+            // Self entry (from == msg.sender) or explicit operator MINT grant — one uniform check.
+            if (FACTORY.permissions(from, msg.sender) & Perm.MINT == 0) {
+                revert ERC20InsufficientBalance(from, balance, value);
+            }
             mint_(from, value - balance);
         }
 
         _transfer(from, to, value);
 
-        if (FACTORY.autoMintBurn(to)) {
+        if (FACTORY.permissions(to, to) & Perm.BURN != 0) {
             uint256 receiptBal = receipt.balanceOf(to);
             if (receiptBal > 0) {
                 _burn(to, Math.min(receiptBal, value));
@@ -291,10 +305,10 @@ contract Option is ERC20, ReentrancyGuardTransient {
     }
 
     /// @inheritdoc ERC20
-    /// @dev Skips `_spendAllowance` when `msg.sender` is a factory-approved operator for `from`
-    ///      (ERC-1155 style blanket approval across every option in the protocol).
+    /// @dev Skips `_spendAllowance` when `msg.sender` holds `Perm.TRANSFER` in `from`'s factory
+    ///      permission mask (blanket approval across every option in the protocol).
     function transferFrom(address from, address to, uint256 amount) public override beforeDeadline nonReentrant returns (bool) {
-        if (msg.sender != from && !FACTORY.approvedOperator(from, msg.sender)) {
+        if (msg.sender != from && FACTORY.permissions(from, msg.sender) & Perm.TRANSFER == 0) {
             _spendAllowance(from, msg.sender, amount);
         }
         _settledTransfer(from, to, amount);
@@ -325,11 +339,11 @@ contract Option is ERC20, ReentrancyGuardTransient {
     ///             flash loan with the consideration cost, and pays the holder the spread), or
     ///         (b) the holder explicitly intends to gift the exercise value to `msg.sender`.
     ///
-    ///         Authorisation: `msg.sender` must be `holder` themselves or have been authorised
-    ///         via `factory.allowExercise(msg.sender, true)`. **Authorising a non-trusted
-    ///         exercisor is equivalent to giving them a withdrawal right over your ITM value.**
-    ///         `factory.approveOperator` does NOT grant exercise rights — it gates ERC20
-    ///         transfer of option tokens only.
+    ///         Authorisation: `msg.sender` must be `holder` themselves or hold `Perm.EXERCISE`
+    ///         in the holder's factory permission mask (`factory.setPermissions(keeper,
+    ///         Perm.EXERCISE)`). **Granting EXERCISE to a non-trusted operator is equivalent to
+    ///         giving them a withdrawal right over your ITM value.** `Perm.TRANSFER` does NOT
+    ///         grant exercise rights — it gates ERC20 transfer of option tokens only.
     ///
     ///         Allowed any time exercise itself is allowed (pre-expiry for American, plus the
     ///         post-expiry window for both flavours).
@@ -338,7 +352,7 @@ contract Option is ERC20, ReentrancyGuardTransient {
     ///
     ///         ```solidity
     ///         // Keeper contract (audited, allowlisted off-chain). Holder authorises once:
-    ///         //   factory.allowExercise(address(keeper), true);
+    ///         //   factory.setPermissions(address(keeper), Perm.EXERCISE);
     ///         contract FlashExerciseKeeper is IERC3156FlashBorrower {
     ///             function settle(Option opt, address holder, uint256 amount, uint256 minSurplus)
     ///                 external
@@ -384,13 +398,13 @@ contract Option is ERC20, ReentrancyGuardTransient {
     ///         ```
     ///
     ///         The holder bears no smart-contract risk beyond trusting `FlashExerciseKeeper` not
-    ///         to revert on step 6 — which is why `allowExercise` should only ever be granted to
+    ///         to revert on step 6 — which is why `Perm.EXERCISE` should only ever be granted to
     ///         a deployed, audited keeper address, never an EOA.
     /// @param holder Option holder whose tokens will be burned.
     /// @param amount Collateral units to exercise.
     /// @return The amount of collateral units actually exercised (== `amount` on success).
     function exerciseFor(address holder, uint256 amount) public canExercise nonReentrant nonZero(amount) returns (uint256) {
-        if (msg.sender != holder && !FACTORY.exerciseAllowed(holder, msg.sender)) {
+        if (msg.sender != holder && FACTORY.permissions(holder, msg.sender) & Perm.EXERCISE == 0) {
             revert Unauthorized();
         }
         _burn(holder, amount);
@@ -414,7 +428,7 @@ contract Option is ERC20, ReentrancyGuardTransient {
             address h = holders[i];
             uint256 a = amounts[i];
             if (a == 0 || balanceOf(h) < a) continue;
-            if (msg.sender != h && !FACTORY.exerciseAllowed(h, msg.sender)) continue;
+            if (msg.sender != h && FACTORY.permissions(h, msg.sender) & Perm.EXERCISE == 0) continue;
             _burn(h, a);
             receipt.exercise(msg.sender, a);
             emit Exercise(address(this), msg.sender, h, a);
@@ -429,9 +443,25 @@ contract Option is ERC20, ReentrancyGuardTransient {
     ///         exercise window to be closed. Once `block.timestamp > exerciseDeadline`, short-side
     ///         exits must route through `Receipt._redeem`. Caller must hold both sides in equal amount.
     /// @param amount Collateral-denominated amount to burn from each side.
-    function burn(uint256 amount) public nonReentrant nonZero(amount) beforeDeadline {
-        _burn(msg.sender, amount);
-        receipt.burn(msg.sender, amount);
+    function burn(uint256 amount) public {
+        burn(msg.sender, amount);
+    }
+
+    /// @notice Burn `amount` matched `Option` + `Receipt` pairs held by `account`, returning the
+    ///         underlying collateral to `account`.
+    /// @dev    Same timing rules as {burn(uint256)}. The caller must be `account` itself or hold
+    ///         `Perm.BURN` in `account`'s factory permission mask. Trigger-only grant: the
+    ///         recovered collateral always goes to `account` (via `Receipt.burn`), never to the
+    ///         caller, so a BURN operator can unwind a holder's matched position but not extract
+    ///         value from it.
+    /// @param account Holder of the matched Option + Receipt pair.
+    /// @param amount  Collateral-denominated amount to burn from each side.
+    function burn(address account, uint256 amount) public nonReentrant nonZero(amount) beforeDeadline {
+        if (msg.sender != account && FACTORY.permissions(account, msg.sender) & Perm.BURN == 0) {
+            revert Unauthorized();
+        }
+        _burn(account, amount);
+        receipt.burn(account, amount);
     }
 
     /// @notice Burn expired long option tokens to clean up dust.
@@ -442,13 +472,13 @@ contract Option is ERC20, ReentrancyGuardTransient {
     ///         `Receipt`, so it has no effect on the redemption pool or the solvency invariant
     ///         (short-side collateral is recovered separately via `Receipt.redeem`). Reverts with
     ///         `NotYetExpired` on or before the deadline — use {burn} or {exercise} while live.
-    ///         Caller must be `holder` or authorised via `factory.allowExercise(holder, true)`
-    ///         (reverts `Unauthorized` otherwise); unlike {exerciseFor} this is harmless — the
-    ///         tokens are already worthless, so a keeper gains nothing by burning them.
+    ///         Caller must be `holder` or hold `Perm.BURN` in the holder's factory permission mask
+    ///         (reverts `Unauthorized` otherwise) — BURN, not EXERCISE, because this is a pure
+    ///         cleanup burn: the tokens are already worthless, so a keeper gains nothing here.
     /// @param holder Address of the long option holder.
     /// @param amount Amount of long option tokens to burn.
     function expire(address holder, uint256 amount) public nonReentrant nonZero(amount) {
-        if (msg.sender != holder && !FACTORY.exerciseAllowed(holder, msg.sender)) revert Unauthorized();
+        if (msg.sender != holder && FACTORY.permissions(holder, msg.sender) & Perm.BURN == 0) revert Unauthorized();
         if (block.timestamp <= exerciseDeadline()) revert NotYetExpired();
         _burn(holder, amount);
         emit Expire(address(this), msg.sender, holder, amount);

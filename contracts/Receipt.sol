@@ -13,12 +13,13 @@ using SafeERC20 for IERC20;
 
 import { TokenData } from "./interfaces/IOption.sol";
 import { OptionUtils } from "./OptionUtils.sol";
+import { Perm } from "./Permissions.sol";
 
 /// @dev Narrow view of {Factory} used by {Receipt} to pull collateral/consideration tokens via the
 ///      factory's centralised allowance registry.
 interface IFactory {
     function transferFrom(address from, address to, uint256 amount, address token) external;
-    function redeemAllowed(address holder, address redeemer) external view returns (bool);
+    function permissions(address owner, address operator) external view returns (uint256);
     function owner() external view returns (address);
 }
 
@@ -232,7 +233,7 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
     /// @notice Exercise path invoked by Option. `account` both pays the consideration and receives
     ///         the collateral — the two sides are coupled at this boundary so Receipt never has to
     ///         settle "pay-for-someone-else" semantics. Option enforces the matching authorisation
-    ///         (self-exercise or `factory.allowExercise`) before calling.
+    ///         (self-exercise or the holder's `Perm.EXERCISE` grant) before calling.
     /// @param account The address paying consideration and receiving collateral.
     /// @param amount  Collateral units to deliver; consideration collected is `ceil(amount * strike)`.
     function exercise(address account, uint256 amount) public onlyOption nonReentrant {
@@ -317,8 +318,8 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
 
     // ============ BATCH REDEEM (KEEPER-GATED) ============
 
-    /// @notice Keeper-triggered batch redeem. For each holder where the caller is authorised via
-    ///         `factory.allowRedeem(holder, msg.sender, true)` (or `msg.sender == holder`), the
+    /// @notice Keeper-triggered batch redeem. For each holder where the caller holds `Perm.REDEEM`
+    ///         in the holder's factory permission mask (or `msg.sender == holder`), the
     ///         holder's full balance is redeemed under {redeem} semantics (cons-first; mix only
     ///         post-window). The resulting collateral / consideration go to the **holder** —
     ///         never to the caller. Unauthorised and zero-balance holders are skipped silently
@@ -333,7 +334,7 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
     function redeemFor(address[] calldata holders) external nonReentrant {
         for (uint256 i = 0; i < holders.length; i++) {
             address h = holders[i];
-            if (msg.sender != h && !factory.redeemAllowed(h, msg.sender)) continue;
+            if (msg.sender != h && factory.permissions(h, msg.sender) & Perm.REDEEM == 0) continue;
             if (balanceOf(h) == 0) continue;
             _redeem(h, balanceOf(h));
         }
