@@ -79,9 +79,12 @@ interface IFactory {
     ///         MINT (2), BURN (4), REDEEM (8), EXERCISE (16). The self entry
     ///         `permissions(account, account)` carries the account's automation opt-ins
     ///         (MINT = auto-mint on shortfall, BURN = auto-burn on receive).
+    ///
+    ///         To test a grant, mind ALL-vs-ANY — for a multi-bit mask they differ, and the wrong
+    ///         one fails open:
+    ///           holds every bit: `permissions(o, op) & mask == mask`
+    ///           holds any bit:   `permissions(o, op) & mask != 0`
     function permissions(address owner, address operator) external view returns (uint256);
-    /// @notice `true` if `operator` holds every bit of `mask` in `owner`'s grant.
-    function hasPermissions(address owner, address operator, uint256 mask) external view returns (bool);
 
     /// @notice Create a new Option + Receipt pair per the given parameters, or return the existing
     ///         canonical Option if one with economically-identical params already exists (get-or-create).

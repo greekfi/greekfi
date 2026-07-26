@@ -332,9 +332,4 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
         permissions[msg.sender][operator] = updated;
         emit PermissionsUpdated(msg.sender, operator, updated);
     }
-
-    /// @notice `true` if `operator` holds every bit of `mask` in `owner_`'s grant.
-    function hasPermissions(address owner_, address operator, uint256 mask) external view returns (bool) {
-        return permissions[owner_][operator] & mask == mask;
-    }
 }
