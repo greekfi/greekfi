@@ -101,10 +101,13 @@ contract Option is ERC20, ReentrancyGuardTransient {
     /// @param amount      Collateral units delivered (consideration paid is `toConsideration(amount, true)`, ceil).
     event Exercise(address longOption, address caller, address holder, uint256 amount);
 
-    /// @notice Emitted when expired (post-deadline) long option tokens are burned via {expire}.
+    /// @notice Emitted **only** by an explicit {expire} call — the sole site that emits this event.
+    ///         An option passing `exerciseDeadline` emits nothing on its own; expiry is a timestamp
+    ///         comparison, not a transaction. Indexers must not treat this as "the option expired",
+    ///         only as "someone burned already-worthless long tokens".
     /// @param longOption  The Option contract (always `address(this)`).
-    /// @param caller      The account that initiated the expiration — the holder themselves, or an
-    ///                    operator holding `Perm.BURN` in the holder's factory permission mask.
+    /// @param caller      The account that called {expire} — the holder themselves, or an operator
+    ///                    holding `Perm.BURN` in the holder's factory permission mask.
     /// @param holder      The account whose options were burned.
     /// @param amount      Amount of options burned.
     event Expire(address longOption, address caller, address holder, uint256 amount);

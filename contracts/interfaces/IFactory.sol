@@ -52,7 +52,7 @@ interface IFactory {
     error InvalidAddress();
     /// @notice Collateral and consideration were the same address.
     error InvalidTokens();
-    /// @notice A value param (strike, expiration, window, decimals, salt-array length, permission
+    /// @notice A value param (strike, expiration, window, decimals, permission
     ///         mask) is invalid.
     error InvalidValue();
     /// @notice Token transferFrom delivered less than `amount` — fee-on-transfer / rebasing tokens are not supported.
@@ -88,26 +88,6 @@ interface IFactory {
     function createOption(CreateParams memory params) external returns (address);
     /// @notice Batch form of {createOption}.
     function createOptions(CreateParams[] memory params) external returns (address[] memory);
-    /// @notice CREATE2 form of {createOption}: the Option and Receipt clones land at addresses derived
-    ///         from `optionSalt` / `receiptSalt`, allowing vanity addresses mined off-chain. Mine
-    ///         `optionSalt` first — the Receipt's init code embeds the resulting Option address.
-    ///         If an economically-identical option already exists, both salts are ignored and the
-    ///         existing address is returned (get-or-create wins).
-    function createOption2(CreateParams memory params, bytes32 optionSalt, bytes32 receiptSalt) external returns (address);
-    /// @notice Batch form of {createOption2}; salt arrays are positional and must match `params` length.
-    function createOptions2(CreateParams[] memory params, bytes32[] memory optionSalts, bytes32[] memory receiptSalts)
-        external
-        returns (address[] memory);
-    /// @notice `keccak256` of the Option clone's CREATE2 init code — mine `optionSalt` against this.
-    ///         Takes no params: the Option clone is a bare EIP-1167 proxy with no immutable args.
-    function optionInitCodeHash() external view returns (bytes32);
-    /// @notice `keccak256` of the Receipt clone's CREATE2 init code for `params` + `option_`. Varies per
-    ///         option (the Receipt bakes its economic params and the Option address into its args).
-    function receiptInitCodeHash(CreateParams memory params, address option_) external view returns (bytes32);
-    /// @notice Address the Option clone lands at for `salt` under {createOption2}.
-    function addressOfOption2(bytes32 salt) external view returns (address);
-    /// @notice Address the Receipt clone lands at for `salt` under {createOption2}, given `option_`.
-    function addressOfReceipt2(CreateParams memory params, address option_, bytes32 salt) external view returns (address);
     /// @notice Pull tokens via the token's ERC-20 allowance to the factory. Only callable by Receipt clones.
     function transferFrom(address from, address to, uint256 amount, address token) external returns (bool success);
     /// @notice Set `operator`'s permission mask over the caller's positions, overwriting any

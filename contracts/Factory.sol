@@ -180,66 +180,12 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     /// @return option_ The canonical {Option} address — either freshly deployed, or the existing
     ///         option if an economically-identical one already exists (get-or-create; see {optionFor}).
     function createOption(CreateParams memory p) public nonReentrant nonZero(p.strike) returns (address option_) {
-        return _createOption(p, bytes32(0), bytes32(0));
+        return _createOption(p);
     }
 
-    /// @notice CREATE2 variant of {createOption}: deploys the Option and Receipt clones at addresses
-    ///         derived from caller-supplied salts, so both can be mined off-chain for a vanity prefix
-    ///         (e.g. an Option at `0x0000…` and its Receipt at `0xffff…`).
-    /// @dev    Naming mirrors the `clone` / `clone2` convention of the underlying clone library.
-    ///         Identical to {createOption} in every respect except the deploy opcode — same validation,
-    ///         same registry, same event, same `Option.init` wiring.
-    ///
-    ///         **Mine `optionSalt` first, then `receiptSalt` — the order is forced.** The Receipt's
-    ///         immutable args embed the Option's address, so the Receipt's init code (and therefore its
-    ///         address) depends on where the Option landed. The reverse is not true: the Option reaches
-    ///         its Receipt through a storage pointer set by {Option.init}, which cannot affect the
-    ///         Option's own address. The two searches cannot be parallelised.
-    ///
-    ///         Off-chain, mine against {optionInitCodeHash} then {receiptInitCodeHash}; both are plain
-    ///         `keccak256(0xff ‖ factory ‖ salt ‖ initCodeHash)` searches over a fixed 85-byte preimage,
-    ///         where only the 32 salt bytes change per attempt. Budget roughly 16^n attempts for an
-    ///         n-hex-char prefix (~84k for 4 chars — well under a second in a browser).
-    ///
-    ///         **Get-or-create still wins.** If an economically-identical Option already exists, both
-    ///         salts are IGNORED and the existing address is returned — the caller does not get a vanity
-    ///         address for an option that someone already created. Check {optionFor}/{optionKey} before
-    ///         spending time mining.
-    ///
-    ///         **Salts are a first-come-first-served global namespace.** A salt already used against the
-    ///         same template (by anyone) reverts the deploy — the address is occupied. Re-mine and retry.
-    ///         Salts are deliberately NOT namespaced by `msg.sender`: an attacker front-running this call
-    ///         with the same params is harmless (get-or-create returns their Option, at the address you
-    ///         mined), and one who burns your salt on a *different* option only forces a re-mine.
-    ///
-    ///         **A zero salt means "don't mine this one".** `bytes32(0)` is a sentinel selecting plain
-    ///         CREATE for that clone, exactly as {createOption} would. The two salts are independent, so
-    ///         all four combinations are valid — vanity both, vanity neither (identical to
-    ///         {createOption}), or vanity just the Option / just the Receipt. This costs you the ability
-    ///         to use `bytes32(0)` as a real CREATE2 salt; that is a deliberate trade, since a mined
-    ///         vanity salt is effectively random and will never be zero.
-    /// @param p           See {CreateParams} — identical semantics to {createOption}.
-    /// @param optionSalt  CREATE2 salt for the Option clone, or `bytes32(0)` for plain CREATE.
-    ///                    Mine against {optionInitCodeHash}.
-    /// @param receiptSalt CREATE2 salt for the Receipt clone, or `bytes32(0)` for plain CREATE.
-    ///                    Mine against {receiptInitCodeHash}, which requires the Option address implied
-    ///                    by `optionSalt`.
-    /// @return option_ The canonical {Option} address — freshly deployed at the mined address, or the
-    ///         pre-existing option if one with identical params already exists (salts ignored).
-    function createOption2(CreateParams memory p, bytes32 optionSalt, bytes32 receiptSalt)
-        public
-        nonReentrant
-        nonZero(p.strike)
-        returns (address option_)
-    {
-        return _createOption(p, optionSalt, receiptSalt);
-    }
-
-    /// @dev Shared body of {createOption} and {createOption2}. Each clone independently uses CREATE2
-    ///      when its salt is non-zero and plain CREATE when it is `bytes32(0)`; every other step is
-    ///      identical, so the entry points cannot drift in validation, args layout, or registry
-    ///      bookkeeping. {createOption} is therefore exactly `_createOption(p, 0, 0)`.
-    function _createOption(CreateParams memory p, bytes32 optionSalt, bytes32 receiptSalt) internal returns (address option_) {
+    /// @dev Body of {createOption}, kept separate so validation, args layout and registry
+    ///      bookkeeping live in one place.
+    function _createOption(CreateParams memory p) internal returns (address option_) {
         if (p.collateral == p.consideration) revert InvalidTokens();
         if (p.collateral == address(0) || p.consideration == address(0)) revert InvalidAddress();
         if (p.expirationDate <= block.timestamp) revert InvalidValue();
@@ -270,12 +216,9 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
         }
 
         // Deploy Option first so we know its address before baking Receipt's immutable args.
-        // Zero salt => plain CREATE (the {createOption} path); non-zero => CREATE2 at a mined address.
-        option_ = optionSalt == bytes32(0) ? Clones.clone(OPTION_CLONE) : Clones.cloneDeterministic(OPTION_CLONE, optionSalt);
+        option_ = Clones.clone(OPTION_CLONE);
         bytes memory args = _receiptArgs(p, option_, collDec, consDec);
-        address receipt_ = receiptSalt == bytes32(0)
-            ? ClonesWithImmutableArgs.clone(RECEIPT_CLONE, args)
-            : ClonesWithImmutableArgs.clone2(RECEIPT_CLONE, receiptSalt, args);
+        address receipt_ = ClonesWithImmutableArgs.clone(RECEIPT_CLONE, args);
 
         Option(option_).init(receipt_);
         receipts[receipt_] = true;
@@ -285,9 +228,7 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
         );
     }
 
-    /// @dev Builds the Receipt's packed immutable args. Single source of truth shared by the deploy
-    ///      path and {receiptInitCodeHash}, so a predicted address can never disagree with the
-    ///      deployed one.
+    /// @dev Builds the Receipt's packed immutable args.
     ///      Immutable-args layout (112 bytes packed, MUST match Receipt's _getArg* offsets):
     ///      strike[32] coll[20] cons[20] option[20] expirationDate[8] exerciseDeadline[8]
     ///      isPut[1] isEuro[1] collDec[1] consDec[1]. p.strike is uint256 → encodePacked emits 32B.
@@ -318,70 +259,6 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
         for (uint256 i = 0; i < params.length; i++) {
             result[i] = createOption(params[i]);
         }
-    }
-
-    /// @notice Batch form of {createOption2}. Same ordering in → same ordering out.
-    /// @dev    Salt arrays are positional and must be the same length as `params`.
-    ///         Mine each pair independently: within one batch, entry `i`'s Receipt salt depends only on
-    ///         entry `i`'s Option address, not on any other entry.
-    ///
-    ///         Zero salts fall back to plain CREATE per-clone (see {createOption2}), so a single batch
-    ///         can freely mix mined and unmined entries — pass `bytes32(0)` for any clone you don't want
-    ///         a vanity address for, and that entry behaves exactly like {createOption}.
-    /// @param params       Array of {CreateParams}.
-    /// @param optionSalts  Option-clone CREATE2 salts, aligned with `params`.
-    /// @param receiptSalts Receipt-clone CREATE2 salts, aligned with `params`.
-    /// @return result Array of Option addresses, aligned with `params`.
-    function createOptions2(CreateParams[] memory params, bytes32[] memory optionSalts, bytes32[] memory receiptSalts)
-        external
-        returns (address[] memory result)
-    {
-        if (params.length != optionSalts.length || params.length != receiptSalts.length) revert InvalidValue();
-        result = new address[](params.length);
-        for (uint256 i = 0; i < params.length; i++) {
-            result[i] = createOption2(params[i], optionSalts[i], receiptSalts[i]);
-        }
-    }
-
-    // ============ CREATE2 ADDRESS PREDICTION ============
-
-    /// @notice `keccak256` of the Option clone's CREATE2 init code — the value to mine `optionSalt`
-    ///         against for {createOption2}.
-    /// @dev    The Option clone is a bare EIP-1167 proxy over {OPTION_CLONE} with no immutable args
-    ///         (it carries no economic params of its own — every getter forwards to its Receipt), so
-    ///         this hash does not depend on {CreateParams} and takes no arguments.
-    ///         Off-chain: `address = keccak256(0xff ‖ factory ‖ salt ‖ optionInitCodeHash)[12:]`.
-    function optionInitCodeHash() public view returns (bytes32) {
-        return keccak256(
-            abi.encodePacked(hex"3d602d80600a3d3981f3363d3d373d3d3d363d73", OPTION_CLONE, hex"5af43d82803e903d91602b57fd5bf3")
-        );
-    }
-
-    /// @notice `keccak256` of the Receipt clone's CREATE2 init code — the value to mine `receiptSalt`
-    ///         against for {createOption2}.
-    /// @dev    Unlike {optionInitCodeHash} this is NOT constant: the Receipt's immutable args bake in
-    ///         `option_` plus every economic param, so it must be recomputed per option and can only be
-    ///         derived once the Option's address is known (i.e. after `optionSalt` is mined — pass
-    ///         `addressOfOption2(optionSalt)`). Reads `decimals()` from both tokens, hence `view`.
-    /// @param p       The params the option will be created with.
-    /// @param option_ The Option address that `optionSalt` resolves to.
-    function receiptInitCodeHash(CreateParams memory p, address option_) public view returns (bytes32) {
-        uint8 collDec = IERC20Metadata(p.collateral).decimals();
-        uint8 consDec = IERC20Metadata(p.consideration).decimals();
-        return keccak256(ClonesWithImmutableArgs.creation(RECEIPT_CLONE, _receiptArgs(p, option_, collDec, consDec)));
-    }
-
-    /// @notice Address the Option clone will land at for `salt` under {createOption2}.
-    function addressOfOption2(bytes32 salt) public view returns (address) {
-        return Clones.predictDeterministicAddress(OPTION_CLONE, salt, address(this));
-    }
-
-    /// @notice Address the Receipt clone will land at for `salt` under {createOption2}, given the
-    ///         Option address `option_` that the Option salt resolves to.
-    function addressOfReceipt2(CreateParams memory p, address option_, bytes32 salt) public view returns (address) {
-        return address(
-            uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, receiptInitCodeHash(p, option_)))))
-        );
     }
 
     /// @notice Deterministic registry key for a set of economic params. All seven {CreateParams}

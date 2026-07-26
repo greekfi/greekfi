@@ -60,9 +60,11 @@ interface IOption {
     ///         dangerous `exerciseFor` overloads) the collateral recipient; `holder`'s options are
     ///         burned.
     event Exercise(address longOption, address caller, address holder, uint256 amount);
-    /// @notice Emitted on {IOption.expire} when expired (post-deadline) long tokens are burned.
-    ///         `caller` is the holder themselves, or an operator holding `Perm.BURN` in the
-    ///         holder's factory permission mask.
+    /// @notice Emitted **only** by an explicit {IOption.expire} call, which is the sole site that
+    ///         emits it. Passing `exerciseDeadline` emits nothing by itself — expiry is a timestamp
+    ///         comparison, not a transaction — so this is not a signal that an option expired, only
+    ///         that someone burned already-worthless long tokens. `caller` is the holder themselves,
+    ///         or an operator holding `Perm.BURN` in the holder's factory permission mask.
     event Expire(address longOption, address caller, address holder, uint256 amount);
 
     /// @notice A path that requires a live option was called after expiration.
