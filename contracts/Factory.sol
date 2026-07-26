@@ -180,12 +180,6 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     /// @return option_ The canonical {Option} address — either freshly deployed, or the existing
     ///         option if an economically-identical one already exists (get-or-create; see {optionFor}).
     function createOption(CreateParams memory p) public nonReentrant nonZero(p.strike) returns (address option_) {
-        return _createOption(p);
-    }
-
-    /// @dev Body of {createOption}, kept separate so validation, args layout and registry
-    ///      bookkeeping live in one place.
-    function _createOption(CreateParams memory p) internal returns (address option_) {
         if (p.collateral == p.consideration) revert InvalidTokens();
         if (p.collateral == address(0) || p.consideration == address(0)) revert InvalidAddress();
         if (p.expirationDate <= block.timestamp) revert InvalidValue();
