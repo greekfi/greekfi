@@ -158,6 +158,19 @@ contract Option is ERC20, ReentrancyGuardTransient {
         _;
     }
 
+    /// @dev Authorisation predicate for acting on `owner_`'s position: true when `operator` is
+    ///      neither `owner_` themselves nor holds `perm` in `owner_`'s factory permission mask.
+    ///      Argument order mirrors the registry it wraps (`permissions[owner][operator]`).
+    ///
+    ///      **Authorisation only — do NOT use this for the auto-mint / auto-burn legs of
+    ///      {_settledTransfer}.** Those read the *self* entry as an opt-in, and the
+    ///      `operator != owner_` bypass here would silently turn "did this account opt in?" into
+    ///      "is this account acting on itself?", enabling the automation for every account rather
+    ///      than the ones that asked for it. Those two sites spell the lookup out deliberately.
+    function notAuthorized(address owner_, address operator, uint256 perm) internal view returns (bool) {
+        return operator != owner_ && FACTORY.permissions(owner_, operator) & perm == 0;
+    }
+
     /// @notice Template constructor. Never called for user-facing instances; each clone goes
     ///         through {init} instead. Sets `receipt` to a non-zero sentinel so the template
     ///         itself fails the {init} guard.
@@ -260,9 +273,7 @@ contract Option is ERC20, ReentrancyGuardTransient {
     /// @param account Recipient of both `Option` and `Receipt` tokens. Pays the collateral.
     /// @param amount  Collateral-denominated mint amount.
     function mint(address account, uint256 amount) public nonReentrant {
-        if (msg.sender != account && FACTORY.permissions(account, msg.sender) & Perm.MINT == 0) {
-            revert Unauthorized();
-        }
+        if (notAuthorized(account, msg.sender, Perm.MINT)) revert Unauthorized();
         mint_(account, amount);
     }
 
@@ -307,7 +318,9 @@ contract Option is ERC20, ReentrancyGuardTransient {
     function _settledTransfer(address from, address to, uint256 value) internal {
         uint256 balance = balanceOf(from);
         if (balance < value) {
-            // Self entry (from == msg.sender) or explicit operator MINT grant — one uniform check.
+            // Spelled out, NOT {notAuthorized}: there is deliberately no `from == msg.sender`
+            // bypass. When the sender moves their own tokens this reads the self entry, which is
+            // the holder's auto-mint OPT-IN — bypassing it would arm auto-mint for everyone.
             if (FACTORY.permissions(from, msg.sender) & Perm.MINT == 0) {
                 revert ERC20InsufficientBalance(from, balance, value);
             }
@@ -316,6 +329,10 @@ contract Option is ERC20, ReentrancyGuardTransient {
 
         _transfer(from, to, value);
 
+        // Spelled out, NOT {notAuthorized}: there must be no `msg.sender == to` bypass here. When
+        // the receiver moves their own tokens this reads their self entry, which is the auto-burn
+        // OPT-IN; the helper would treat acting-on-yourself as consent and net every self-transfer
+        // whether or not the account asked for it.
         if (FACTORY.permissions(to, msg.sender) & Perm.BURN != 0) {
             uint256 receiptBal = receipt.balanceOf(to);
             if (receiptBal > 0) {
@@ -338,9 +355,7 @@ contract Option is ERC20, ReentrancyGuardTransient {
     /// @dev Skips `_spendAllowance` when `msg.sender` holds `Perm.TRANSFER` in `from`'s factory
     ///      permission mask (blanket approval across every option in the protocol).
     function transferFrom(address from, address to, uint256 amount) public override beforeDeadline nonReentrant returns (bool) {
-        if (msg.sender != from && FACTORY.permissions(from, msg.sender) & Perm.TRANSFER == 0) {
-            _spendAllowance(from, msg.sender, amount);
-        }
+        if (notAuthorized(from, msg.sender, Perm.TRANSFER)) _spendAllowance(from, msg.sender, amount);
         _settledTransfer(from, to, amount);
         return true;
     }
@@ -435,9 +450,7 @@ contract Option is ERC20, ReentrancyGuardTransient {
     /// @param amount Collateral units to exercise.
     /// @return The amount of collateral units actually exercised (== `amount` on success).
     function exerciseFor(address holder, uint256 amount) public canExercise nonReentrant nonZero(amount) returns (uint256) {
-        if (msg.sender != holder && FACTORY.permissions(holder, msg.sender) & Perm.EXERCISE == 0) {
-            revert Unauthorized();
-        }
+        if (notAuthorized(holder, msg.sender, Perm.EXERCISE)) revert Unauthorized();
         _burn(holder, amount);
         receipt.exercise(msg.sender, amount);
         emit Exercise(address(this), msg.sender, holder, amount);
@@ -459,7 +472,7 @@ contract Option is ERC20, ReentrancyGuardTransient {
             address h = holders[i];
             uint256 a = amounts[i];
             if (a == 0 || balanceOf(h) < a) continue;
-            if (msg.sender != h && FACTORY.permissions(h, msg.sender) & Perm.EXERCISE == 0) continue;
+            if (notAuthorized(h, msg.sender, Perm.EXERCISE)) continue;
             _burn(h, a);
             receipt.exercise(msg.sender, a);
             emit Exercise(address(this), msg.sender, h, a);
@@ -488,9 +501,7 @@ contract Option is ERC20, ReentrancyGuardTransient {
     /// @param account Holder of the matched Option + Receipt pair.
     /// @param amount  Collateral-denominated amount to burn from each side.
     function burn(address account, uint256 amount) public nonReentrant nonZero(amount) beforeDeadline {
-        if (msg.sender != account && FACTORY.permissions(account, msg.sender) & Perm.BURN == 0) {
-            revert Unauthorized();
-        }
+        if (notAuthorized(account, msg.sender, Perm.BURN)) revert Unauthorized();
         _burn(account, amount);
         receipt.burn(account, amount);
     }
@@ -509,7 +520,7 @@ contract Option is ERC20, ReentrancyGuardTransient {
     /// @param holder Address of the long option holder.
     /// @param amount Amount of long option tokens to burn.
     function expire(address holder, uint256 amount) public nonReentrant nonZero(amount) {
-        if (msg.sender != holder && FACTORY.permissions(holder, msg.sender) & Perm.BURN == 0) revert Unauthorized();
+        if (notAuthorized(holder, msg.sender, Perm.BURN)) revert Unauthorized();
         if (block.timestamp <= exerciseDeadline()) revert NotYetExpired();
         _burn(holder, amount);
         emit Expire(address(this), msg.sender, holder, amount);

@@ -127,6 +127,13 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
         _;
     }
 
+    /// @dev Authorisation predicate for acting on `owner_`'s position: true when `operator` is
+    ///      neither `owner_` themselves nor holds `perm` in `owner_`'s factory permission mask.
+    ///      Argument order mirrors the registry it wraps (`permissions[owner][operator]`).
+    function notAuthorized(address owner_, address operator, uint256 perm) internal view returns (bool) {
+        return operator != owner_ && factory.permissions(owner_, operator) & perm == 0;
+    }
+
     /// @dev Rejects zero-amount mutations.
     modifier nonZero(uint256 amount) {
         if (amount == 0) revert ZeroValue();
@@ -378,7 +385,7 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
     function redeemFor(address[] calldata holders) external nonReentrant {
         for (uint256 i = 0; i < holders.length; i++) {
             address h = holders[i];
-            if (msg.sender != h && factory.permissions(h, msg.sender) & Perm.REDEEM == 0) continue;
+            if (notAuthorized(h, msg.sender, Perm.REDEEM)) continue;
             if (balanceOf(h) == 0) continue;
             _redeem(h, balanceOf(h));
         }
