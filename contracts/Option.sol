@@ -28,18 +28,25 @@ interface IFactory {
  *         Settlement is purely time-gated, no oracle is consulted at any point. Two flavours
  *         coexist, chosen at creation by `isEuro`:
  *
- *         | Mode      | `isEuro` | Pre-expiry exercise | In-window exercise | Post-window      |
- *         | --------- | -------- | ------------------- | ------------------ | ---------------- |
- *         | American  | `false`  | allowed             | allowed            | short pro-rata   |
- *         | European  | `true`   | reverts             | allowed            | short pro-rata   |
+ *         | Mode      | `isEuro` | Pre-expiry exercise | In-window exercise | Post-window short exit |
+ *         | --------- | -------- | ------------------- | ------------------ | ---------------------- |
+ *         | American  | `false`  | allowed             | allowed            | `redeem` — cons-first FCFS |
+ *         | European  | `true`   | reverts             | allowed            | `redeem` — cons-first FCFS |
  *
- *         The exercise window is `[expirationDate, exerciseDeadline)` where
- *         `exerciseDeadline = expirationDate + windowSeconds` (default 8 hours, settable per
- *         option). The holder decides off-chain whether ITM is profitable and pays strike to
- *         exercise; the protocol just enforces timing and the 1:1 collateral invariant.
- *         Pair `burn` (matched long+short burn) is available **pre-expiration only**: once the
- *         option enters settlement, the only exits are `exercise` (window) and pro-rata `redeem`
- *         (post-window).
+ *         Short-side settlement is **NOT pro-rata**. `Receipt.redeem` pays consideration first, on a
+ *         first-come-first-served basis, and only then collateral 1:1 — so redemption *order*
+ *         decides which asset a writer ends up with. See {Receipt.redeem} for the full semantics
+ *         and the writer strategy that follows from it.
+ *
+ *         The exercise window is `[expirationDate, exerciseDeadline]` (deadline inclusive) where
+ *         `exerciseDeadline = expirationDate + windowSeconds`. `windowSeconds` is set per option
+ *         at creation and taken literally — the contract applies no default
+ *         ({Factory.DEFAULT_EXERCISE_WINDOW} = 8 hours is informational, for frontends). The
+ *         holder decides off-chain whether ITM is profitable and pays strike to exercise; the
+ *         protocol just enforces timing and the 1:1 collateral invariant.
+ *         Pair `burn` (matched long+short burn) is available up to and including
+ *         `exerciseDeadline`; once the window closes, the remaining exits are `redeem`
+ *         (short side, cons-first FCFS) and `expire` (long-side dust burn).
  *
  *         ### Auto-mint / auto-burn
  *
@@ -54,6 +61,13 @@ interface IFactory {
  *
  *         Both behaviours are opt-in per-account and make it possible to treat `Option` and
  *         its underlying collateral as interchangeable for power users (e.g. vaults).
+ *
+ *         Neither is risk-free, and the risks differ. `MINT` on self removes the ERC-20 safety net:
+ *         a transfer larger than your balance no longer reverts, it silently pulls your collateral
+ *         and opens a new short. `BURN` is scoped per counterparty rather than blanket — the
+ *         auto-burn leg reads `permissions(to, msg.sender)`, so your own transfers use your self
+ *         entry, and an inbound transfer only nets if you granted `BURN` to that sender
+ *         (see {_settledTransfer}).
  *
  *         ### Supported tokens
  *
@@ -87,10 +101,11 @@ contract Option is ERC20, ReentrancyGuardTransient {
     /// @param amount      Collateral units delivered (consideration paid is `toConsideration(amount, true)`, ceil).
     event Exercise(address longOption, address caller, address holder, uint256 amount);
 
-    /// @notice Emitted when a holder burns expired (post-deadline) long option tokens via {expire}.
+    /// @notice Emitted when expired (post-deadline) long option tokens are burned via {expire}.
     /// @param longOption  The Option contract (always `address(this)`).
-    /// @param caller      The account that initiated the expiration (always the holder).
-    /// @param holder      The account whose options were burned (== `caller`).
+    /// @param caller      The account that initiated the expiration — the holder themselves, or an
+    ///                    operator holding `Perm.BURN` in the holder's factory permission mask.
+    /// @param holder      The account whose options were burned.
     /// @param amount      Amount of options burned.
     event Expire(address longOption, address caller, address holder, uint256 amount);
 
@@ -272,9 +287,20 @@ contract Option is ERC20, ReentrancyGuardTransient {
     ///      doesn't hold — auto-mint pulls `from`'s collateral allowance to manufacture the
     ///      missing balance, which is why {Perm} documents MINT as a permit on collateral.
     ///
-    ///      The auto-burn leg keys on the **receiver's self entry** (`Perm.BURN` on
-    ///      `permissions(to, to)`) — it is the receiving account's own opt-in, independent of
-    ///      whoever initiated the transfer.
+    ///      The auto-burn leg keys on `Perm.BURN` in `permissions(to, msg.sender)` — the **receiver's**
+    ///      grant to whoever initiated the transfer. Consent is therefore per-counterparty, and it
+    ///      always belongs to the account whose position is unwound:
+    ///
+    ///      - `to` moving their own tokens (`msg.sender == to`) resolves to the self entry
+    ///        `permissions(to, to)` — the account's own auto-burn opt-in, unchanged.
+    ///      - a third party sending to `to` must hold `Perm.BURN` in `to`'s row, i.e. `to` explicitly
+    ///        authorised that sender to net incoming options against their short.
+    ///
+    ///      Deliberately NOT keyed on the self entry alone. That would let any bystander force an
+    ///      opted-in account to unwind its matched position at a moment of the bystander's choosing,
+    ///      contradicting the composability guarantee {Receipt.redeemFor} makes. The price of the
+    ///      stricter rule is that auto-burn no longer fires for arbitrary senders: an account that
+    ///      wants incoming options netted must name the venues it accepts them from.
     function _settledTransfer(address from, address to, uint256 value) internal {
         uint256 balance = balanceOf(from);
         if (balance < value) {
@@ -287,7 +313,7 @@ contract Option is ERC20, ReentrancyGuardTransient {
 
         _transfer(from, to, value);
 
-        if (FACTORY.permissions(to, to) & Perm.BURN != 0) {
+        if (FACTORY.permissions(to, msg.sender) & Perm.BURN != 0) {
             uint256 receiptBal = receipt.balanceOf(to);
             if (receiptBal > 0) {
                 _burn(to, Math.min(receiptBal, value));
@@ -297,8 +323,9 @@ contract Option is ERC20, ReentrancyGuardTransient {
     }
 
     /// @inheritdoc ERC20
-    /// @dev Overridden to run the auto-mint / auto-burn hook. Reverts post-expiry —
-    ///      the long token stops circulating once expiration passes.
+    /// @dev Overridden to run the auto-mint / auto-burn hook. Reverts once the exercise window
+    ///      closes (`block.timestamp > exerciseDeadline`) — the long token keeps circulating
+    ///      through the window so holders can still sell to keepers.
     function transfer(address to, uint256 amount) public override beforeDeadline nonReentrant returns (bool) {
         _settledTransfer(msg.sender, to, amount);
         return true;
@@ -342,8 +369,10 @@ contract Option is ERC20, ReentrancyGuardTransient {
     ///         Authorisation: `msg.sender` must be `holder` themselves or hold `Perm.EXERCISE`
     ///         in the holder's factory permission mask (`factory.setPermissions(keeper,
     ///         Perm.EXERCISE)`). **Granting EXERCISE to a non-trusted operator is equivalent to
-    ///         giving them a withdrawal right over your ITM value.** `Perm.TRANSFER` does NOT
-    ///         grant exercise rights — it gates ERC20 transfer of option tokens only.
+    ///         giving them a withdrawal right over your ITM value.** `Perm.TRANSFER` does not gate
+    ///         *this function*, but it is not a weaker grant: an operator holding TRANSFER can move
+    ///         your longs to itself and exercise them as their own holder, reaching the same ITM
+    ///         value by a different route. Both bits are custody-grade — see {Perm}.
     ///
     ///         Allowed any time exercise itself is allowed (pre-expiry for American, plus the
     ///         post-expiry window for both flavours).
@@ -375,7 +404,6 @@ contract Option is ERC20, ReentrancyGuardTransient {
     ///                 // 2. Approve the factory to pull the consideration we just borrowed.
     ///                 IReceipt r = IReceipt(opt.receipt());
     ///                 IERC20(r.consideration()).approve(factory, loaned);
-    ///                 factory.approve(address(r.consideration()), loaned);
     ///
     ///                 // 3. Exercise on behalf of the holder. Collateral lands here.
     ///                 opt.exerciseFor(holder, amount);

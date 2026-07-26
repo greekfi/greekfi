@@ -18,7 +18,7 @@ import { Perm } from "./Permissions.sol";
 using SafeERC20 for IERC20;
 
 /**
- * @title  Factory — deployer, allowance hub, permission registry
+ * @title  Factory — deployer, transfer hub, permission registry
  * @author Greek.fi
  * @notice The only on-chain contract users need to interact with to *create* options. Once deployed,
  *         every Option + Receipt pair runs off pre-compiled template clones, so creation is
@@ -26,9 +26,10 @@ using SafeERC20 for IERC20;
  *
  *         The factory also plays two lasting roles post-creation:
  *
- *         1. **Single allowance point.** Users `approve(collateralToken, amount)` on the factory once,
- *            and any Option / Receipt pair created by this factory can pull from that allowance
- *            via {transferFrom}. No need to approve every new option individually.
+ *         1. **Single allowance point.** Users `approve(factory, amount)` on the *token* once
+ *            (standard ERC-20 approval), and any Option / Receipt pair created by this factory can
+ *            pull from that allowance via {transferFrom}. No need to approve every new option
+ *            individually — the token allowance to the factory is the sole gate.
  *
  *         2. **Permission registry.** {setPermissions} / {addPermissions} maintain a per-
  *            (owner, operator) bitmask of {Perm} flags — TRANSFER, MINT, BURN, REDEEM, EXERCISE —
@@ -67,6 +68,19 @@ using SafeERC20 for IERC20;
  *           and NOT supported: the collateral/consideration held by a {Receipt} can silently drift
  *           from the recorded amounts, breaking redemption and solvency. There is no on-chain guard;
  *           such tokens must simply not be used.
+ *         - **Tokens whose transfers can stop working** (pausable, blocklist/blacklist, or any token
+ *           that becomes non-transferable after some date) — NOT supported, and there is no rescue.
+ *           Every exit path (`burn`, `exercise`, `redeem`) ends in a `safeTransfer`, so if either leg
+ *           becomes non-transferable the pair's funds are stuck permanently; {Receipt.sweep} cannot
+ *           help, because it requires `totalSupply() == 0` and that requires the very redemptions
+ *           that are now reverting. Note the consideration leg is redeemed FIRST, so a frozen
+ *           *consideration* token also blocks withdrawal of perfectly good collateral.
+ *           Concretely: **a Greek `Option` token is not valid collateral** for another Greek option —
+ *           `Option.transfer` reverts permanently once its own `exerciseDeadline` passes.
+ *
+ *         Choosing the token pair is the creator's responsibility. `createOption` is permissionless
+ *         and validates only that the two tokens differ, are non-zero, and expose `decimals() <= 36`;
+ *         it cannot and does not check transfer semantics. Frontends MUST surface this at creation.
  *
  *         Do NOT create an option whose collateral or consideration implements either behaviour — its
  *         accounting will not operate correctly. Frontends MUST surface this when users create options.
@@ -82,7 +96,7 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     uint40 public constant DEFAULT_EXERCISE_WINDOW = 8 hours;
 
     /// @notice `true` if the address is a Receipt clone this factory created. Doubles as the auth
-    ///         gate for {transferFrom} — only registered Receipts can pull from factory allowances.
+    ///         gate for {transferFrom} — only registered Receipts can pull collateral/consideration.
     ///         Validate an Option by reading its `receipt()` and confirming
     ///         `factory.receipts(rec) && Receipt(rec).option() == opt`.
     mapping(address => bool) public receipts;
@@ -93,9 +107,6 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     ///         Option instead of deploying a duplicate, so identical markets stay canonical/deduped
     ///         and existence is queryable on-chain.
     mapping(bytes32 => address) public optionFor;
-
-    /// @dev Per-token allowance table: `_allowances[token][owner] -> amount`.
-    mapping(address => mapping(address => uint256)) private _allowances;
 
     /// @notice Permission table: `permissions[owner][operator] -> bitmask` of {Perm} flags.
     ///         One row per (owner, operator) pair covering every option this factory created:
@@ -138,8 +149,6 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     /// @notice Emitted whenever `owner`'s permission mask for `operator` changes ({setPermissions}
     ///         / {addPermissions}). `mask` is the full resulting mask, not a delta.
     event PermissionsUpdated(address indexed owner, address indexed operator, uint256 mask);
-    /// @notice Emitted on {approve} (factory-level allowance set by token owner).
-    event Approval(address indexed token, address indexed owner, uint256 amount);
 
     /// @notice Deploys the Option and Receipt templates internally so they record this factory
     ///         as their immutable `factory` (used to gate `init` and skip per-clone storage).
@@ -171,6 +180,66 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     /// @return option_ The canonical {Option} address — either freshly deployed, or the existing
     ///         option if an economically-identical one already exists (get-or-create; see {optionFor}).
     function createOption(CreateParams memory p) public nonReentrant nonZero(p.strike) returns (address option_) {
+        return _createOption(p, bytes32(0), bytes32(0));
+    }
+
+    /// @notice CREATE2 variant of {createOption}: deploys the Option and Receipt clones at addresses
+    ///         derived from caller-supplied salts, so both can be mined off-chain for a vanity prefix
+    ///         (e.g. an Option at `0x0000…` and its Receipt at `0xffff…`).
+    /// @dev    Naming mirrors the `clone` / `clone2` convention of the underlying clone library.
+    ///         Identical to {createOption} in every respect except the deploy opcode — same validation,
+    ///         same registry, same event, same `Option.init` wiring.
+    ///
+    ///         **Mine `optionSalt` first, then `receiptSalt` — the order is forced.** The Receipt's
+    ///         immutable args embed the Option's address, so the Receipt's init code (and therefore its
+    ///         address) depends on where the Option landed. The reverse is not true: the Option reaches
+    ///         its Receipt through a storage pointer set by {Option.init}, which cannot affect the
+    ///         Option's own address. The two searches cannot be parallelised.
+    ///
+    ///         Off-chain, mine against {optionInitCodeHash} then {receiptInitCodeHash}; both are plain
+    ///         `keccak256(0xff ‖ factory ‖ salt ‖ initCodeHash)` searches over a fixed 85-byte preimage,
+    ///         where only the 32 salt bytes change per attempt. Budget roughly 16^n attempts for an
+    ///         n-hex-char prefix (~84k for 4 chars — well under a second in a browser).
+    ///
+    ///         **Get-or-create still wins.** If an economically-identical Option already exists, both
+    ///         salts are IGNORED and the existing address is returned — the caller does not get a vanity
+    ///         address for an option that someone already created. Check {optionFor}/{optionKey} before
+    ///         spending time mining.
+    ///
+    ///         **Salts are a first-come-first-served global namespace.** A salt already used against the
+    ///         same template (by anyone) reverts the deploy — the address is occupied. Re-mine and retry.
+    ///         Salts are deliberately NOT namespaced by `msg.sender`: an attacker front-running this call
+    ///         with the same params is harmless (get-or-create returns their Option, at the address you
+    ///         mined), and one who burns your salt on a *different* option only forces a re-mine.
+    ///
+    ///         **A zero salt means "don't mine this one".** `bytes32(0)` is a sentinel selecting plain
+    ///         CREATE for that clone, exactly as {createOption} would. The two salts are independent, so
+    ///         all four combinations are valid — vanity both, vanity neither (identical to
+    ///         {createOption}), or vanity just the Option / just the Receipt. This costs you the ability
+    ///         to use `bytes32(0)` as a real CREATE2 salt; that is a deliberate trade, since a mined
+    ///         vanity salt is effectively random and will never be zero.
+    /// @param p           See {CreateParams} — identical semantics to {createOption}.
+    /// @param optionSalt  CREATE2 salt for the Option clone, or `bytes32(0)` for plain CREATE.
+    ///                    Mine against {optionInitCodeHash}.
+    /// @param receiptSalt CREATE2 salt for the Receipt clone, or `bytes32(0)` for plain CREATE.
+    ///                    Mine against {receiptInitCodeHash}, which requires the Option address implied
+    ///                    by `optionSalt`.
+    /// @return option_ The canonical {Option} address — freshly deployed at the mined address, or the
+    ///         pre-existing option if one with identical params already exists (salts ignored).
+    function createOption2(CreateParams memory p, bytes32 optionSalt, bytes32 receiptSalt)
+        public
+        nonReentrant
+        nonZero(p.strike)
+        returns (address option_)
+    {
+        return _createOption(p, optionSalt, receiptSalt);
+    }
+
+    /// @dev Shared body of {createOption} and {createOption2}. Each clone independently uses CREATE2
+    ///      when its salt is non-zero and plain CREATE when it is `bytes32(0)`; every other step is
+    ///      identical, so the entry points cannot drift in validation, args layout, or registry
+    ///      bookkeeping. {createOption} is therefore exactly `_createOption(p, 0, 0)`.
+    function _createOption(CreateParams memory p, bytes32 optionSalt, bytes32 receiptSalt) internal returns (address option_) {
         if (p.collateral == p.consideration) revert InvalidTokens();
         if (p.collateral == address(0) || p.consideration == address(0)) revert InvalidAddress();
         if (p.expirationDate <= block.timestamp) revert InvalidValue();
@@ -201,11 +270,33 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
         }
 
         // Deploy Option first so we know its address before baking Receipt's immutable args.
-        option_ = Clones.clone(OPTION_CLONE);
-        // Immutable-args layout (112 bytes packed, MUST match Receipt's _getArg* offsets):
-        // strike[32] coll[20] cons[20] option[20] expirationDate[8] exerciseDeadline[8]
-        // isPut[1] isEuro[1] collDec[1] consDec[1]. p.strike is uint256 → encodePacked emits 32B.
-        bytes memory args = abi.encodePacked(
+        // Zero salt => plain CREATE (the {createOption} path); non-zero => CREATE2 at a mined address.
+        option_ = optionSalt == bytes32(0) ? Clones.clone(OPTION_CLONE) : Clones.cloneDeterministic(OPTION_CLONE, optionSalt);
+        bytes memory args = _receiptArgs(p, option_, collDec, consDec);
+        address receipt_ = receiptSalt == bytes32(0)
+            ? ClonesWithImmutableArgs.clone(RECEIPT_CLONE, args)
+            : ClonesWithImmutableArgs.clone2(RECEIPT_CLONE, receiptSalt, args);
+
+        Option(option_).init(receipt_);
+        receipts[receipt_] = true;
+        optionFor[key] = option_;
+        emit OptionCreated(
+            p.collateral, p.consideration, p.expirationDate, p.strike, p.isPut, p.isEuro, p.windowSeconds, option_, receipt_
+        );
+    }
+
+    /// @dev Builds the Receipt's packed immutable args. Single source of truth shared by the deploy
+    ///      path and {receiptInitCodeHash}, so a predicted address can never disagree with the
+    ///      deployed one.
+    ///      Immutable-args layout (112 bytes packed, MUST match Receipt's _getArg* offsets):
+    ///      strike[32] coll[20] cons[20] option[20] expirationDate[8] exerciseDeadline[8]
+    ///      isPut[1] isEuro[1] collDec[1] consDec[1]. p.strike is uint256 → encodePacked emits 32B.
+    function _receiptArgs(CreateParams memory p, address option_, uint8 collDec, uint8 consDec)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(
             p.strike,
             p.collateral,
             p.consideration,
@@ -217,14 +308,6 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
             collDec,
             consDec
         );
-        address receipt_ = ClonesWithImmutableArgs.clone(RECEIPT_CLONE, args);
-
-        Option(option_).init(receipt_);
-        receipts[receipt_] = true;
-        optionFor[key] = option_;
-        emit OptionCreated(
-            p.collateral, p.consideration, p.expirationDate, p.strike, p.isPut, p.isEuro, p.windowSeconds, option_, receipt_
-        );
     }
 
     /// @notice Batch form of {createOption}. Same ordering in → same ordering out.
@@ -235,6 +318,70 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
         for (uint256 i = 0; i < params.length; i++) {
             result[i] = createOption(params[i]);
         }
+    }
+
+    /// @notice Batch form of {createOption2}. Same ordering in → same ordering out.
+    /// @dev    Salt arrays are positional and must be the same length as `params`.
+    ///         Mine each pair independently: within one batch, entry `i`'s Receipt salt depends only on
+    ///         entry `i`'s Option address, not on any other entry.
+    ///
+    ///         Zero salts fall back to plain CREATE per-clone (see {createOption2}), so a single batch
+    ///         can freely mix mined and unmined entries — pass `bytes32(0)` for any clone you don't want
+    ///         a vanity address for, and that entry behaves exactly like {createOption}.
+    /// @param params       Array of {CreateParams}.
+    /// @param optionSalts  Option-clone CREATE2 salts, aligned with `params`.
+    /// @param receiptSalts Receipt-clone CREATE2 salts, aligned with `params`.
+    /// @return result Array of Option addresses, aligned with `params`.
+    function createOptions2(CreateParams[] memory params, bytes32[] memory optionSalts, bytes32[] memory receiptSalts)
+        external
+        returns (address[] memory result)
+    {
+        if (params.length != optionSalts.length || params.length != receiptSalts.length) revert InvalidValue();
+        result = new address[](params.length);
+        for (uint256 i = 0; i < params.length; i++) {
+            result[i] = createOption2(params[i], optionSalts[i], receiptSalts[i]);
+        }
+    }
+
+    // ============ CREATE2 ADDRESS PREDICTION ============
+
+    /// @notice `keccak256` of the Option clone's CREATE2 init code — the value to mine `optionSalt`
+    ///         against for {createOption2}.
+    /// @dev    The Option clone is a bare EIP-1167 proxy over {OPTION_CLONE} with no immutable args
+    ///         (it carries no economic params of its own — every getter forwards to its Receipt), so
+    ///         this hash does not depend on {CreateParams} and takes no arguments.
+    ///         Off-chain: `address = keccak256(0xff ‖ factory ‖ salt ‖ optionInitCodeHash)[12:]`.
+    function optionInitCodeHash() public view returns (bytes32) {
+        return keccak256(
+            abi.encodePacked(hex"3d602d80600a3d3981f3363d3d373d3d3d363d73", OPTION_CLONE, hex"5af43d82803e903d91602b57fd5bf3")
+        );
+    }
+
+    /// @notice `keccak256` of the Receipt clone's CREATE2 init code — the value to mine `receiptSalt`
+    ///         against for {createOption2}.
+    /// @dev    Unlike {optionInitCodeHash} this is NOT constant: the Receipt's immutable args bake in
+    ///         `option_` plus every economic param, so it must be recomputed per option and can only be
+    ///         derived once the Option's address is known (i.e. after `optionSalt` is mined — pass
+    ///         `addressOfOption2(optionSalt)`). Reads `decimals()` from both tokens, hence `view`.
+    /// @param p       The params the option will be created with.
+    /// @param option_ The Option address that `optionSalt` resolves to.
+    function receiptInitCodeHash(CreateParams memory p, address option_) public view returns (bytes32) {
+        uint8 collDec = IERC20Metadata(p.collateral).decimals();
+        uint8 consDec = IERC20Metadata(p.consideration).decimals();
+        return keccak256(ClonesWithImmutableArgs.creation(RECEIPT_CLONE, _receiptArgs(p, option_, collDec, consDec)));
+    }
+
+    /// @notice Address the Option clone will land at for `salt` under {createOption2}.
+    function addressOfOption2(bytes32 salt) public view returns (address) {
+        return Clones.predictDeterministicAddress(OPTION_CLONE, salt, address(this));
+    }
+
+    /// @notice Address the Receipt clone will land at for `salt` under {createOption2}, given the
+    ///         Option address `option_` that the Option salt resolves to.
+    function addressOfReceipt2(CreateParams memory p, address option_, bytes32 salt) public view returns (address) {
+        return address(
+            uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, receiptInitCodeHash(p, option_)))))
+        );
     }
 
     /// @notice Deterministic registry key for a set of economic params. All seven {CreateParams}
@@ -253,9 +400,12 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
 
     /// @notice Pull `amount` of `token` from `from` to `to`. Only callable by Receipt clones
     ///         that this factory has created.
-    /// @dev    Decrements `_allowances[token][from]` (unless it is `type(uint256).max`).
-    ///         This is the mechanism by which a single user approval on the factory flows to every
-    ///         option pair it creates, rather than requiring approvals on each Receipt clone.
+    /// @dev    Authorisation and accounting ride entirely on the underlying ERC-20 allowance:
+    ///         `from` grants `token.approve(factory, amount)` once and every Receipt clone this
+    ///         factory created can pull against it (gated here by the `receipts[]` registry).
+    ///         `safeTransferFrom` decrements that allowance normally (or leaves it untouched at
+    ///         `type(uint256).max`). A balance-delta check rejects fee-on-transfer / short-delivery
+    ///         tokens, which would otherwise corrupt the 1:1 collateral accounting.
     /// @param from   Token owner.
     /// @param to     Recipient (typically the calling Receipt contract).
     /// @param amount Token amount to transfer.
@@ -263,40 +413,10 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     /// @return success Always `true` on success; reverts otherwise.
     function transferFrom(address from, address to, uint256 amount, address token) external nonReentrant returns (bool) {
         if (!receipts[msg.sender]) revert InvalidAddress();
-        uint256 currentAllowance = _allowances[token][from];
-        if (currentAllowance < amount) revert ERC20InsufficientAllowance(msg.sender, currentAllowance, amount);
-        if (currentAllowance != type(uint256).max) {
-            _allowances[token][from] = currentAllowance - amount;
-        }
         uint256 balanceBefore = IERC20(token).balanceOf(to);
         IERC20(token).safeTransferFrom(from, to, amount);
         if (IERC20(token).balanceOf(to) - balanceBefore != amount) revert FeeOnTransferNotSupported();
         return true;
-    }
-
-    /// @notice Factory-level allowance lookup: how much of `token` can the factory pull from `owner_`?
-    /// @param token  Token.
-    /// @param owner_ Token owner.
-    /// @return Current allowance.
-    function allowance(address token, address owner_) public view returns (uint256) {
-        return _allowances[token][owner_];
-    }
-
-    /// @notice Permit2-style allowance: caller authorises the factory to pull up to `amount` of
-    ///         `token` (collateral or consideration) on their behalf when any Option / Receipt
-    ///         pair created by this factory needs to move it. The user must also have granted the
-    ///         underlying `token.approve(factory, ...)` so `safeTransferFrom` can land.
-    /// @dev    The allowance fans out to every Receipt clone (gated by the `receipts[]` registry)
-    ///         and is consumed by `mint`, `exercise`, and — if {enableAutoMintBurn} is `true` —
-    ///         the auto-mint leg of Option transfers triggered by approved operators. Granting
-    ///         a large allowance here while also holding active {approveOperator} grants with
-    ///         {enableAutoMintBurn} on is functionally equivalent to a permit on the underlying
-    ///         token in favour of those operators.
-    /// @param token  ERC20 to be approved.
-    /// @param amount Allowance to grant (use `type(uint256).max` for infinite, `0` to revoke).
-    function approve(address token, uint256 amount) public nonZeroAddr(token) {
-        _allowances[token][msg.sender] = amount;
-        emit Approval(token, msg.sender, amount);
     }
 
     // ============ PERMISSIONS ============
@@ -312,8 +432,13 @@ contract Factory is Ownable, ReentrancyGuardTransient, IERC20Errors {
     ///           unaudited integrations.
     ///         - `EXERCISE` lets the operator burn the caller's options, pay the consideration and
     ///           keep the collateral — a withdrawal right over the caller's ITM value.
-    ///         - `TRANSFER` only moves existing balance; `BURN` / `REDEEM` are pure triggers whose
-    ///           proceeds always return to the caller.
+    ///         - `TRANSFER` is full custody of the caller's long positions: the operator can move
+    ///           them to itself and exercise them as their own holder, taking the ITM value without
+    ///           ever needing `EXERCISE`. Alongside `MINT` it also reaches auto-mint, so it is not
+    ///           limited to balance the caller actually holds.
+    ///         - `BURN` / `REDEEM` return their proceeds to the caller, but the operator picks the
+    ///           moment — and for `REDEEM` the moment determines which leg the caller is settled
+    ///           into, and can strand them in a naked long. Neither is risk-free.
     ///
     ///         `operator == msg.sender` is the **self entry**: `MINT` opts into auto-mint on
     ///         transfer shortfall, `BURN` opts into auto-burn on receive (see {Perm}); the other

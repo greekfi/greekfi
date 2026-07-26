@@ -26,10 +26,10 @@ struct CreateParams {
     uint40 windowSeconds;
 }
 
-/// @title  IFactory — option pair deployer + allowance hub
+/// @title  IFactory — option pair deployer + transfer hub
 /// @author Greek.fi
-/// @notice Deploys Option + Receipt pairs via EIP-1167 clones, serves as the single ERC20 approval
-///         point for every option pair it creates, and holds the per-(owner, operator)
+/// @notice Deploys Option + Receipt pairs via EIP-1167 clones, serves as the single ERC20-allowance
+///         pull point for every option pair it creates, and holds the per-(owner, operator)
 ///         permission registry ({Perm} bitmasks: TRANSFER / MINT / BURN / REDEEM / EXERCISE).
 interface IFactory {
     /// @notice Emitted for every newly-created option.
@@ -47,14 +47,13 @@ interface IFactory {
     /// @notice Emitted whenever `owner`'s permission mask for `operator` changes ({setPermissions}
     ///         / {addPermissions}). `mask` is the full resulting mask, not a delta.
     event PermissionsUpdated(address indexed owner, address indexed operator, uint256 mask);
-    /// @notice Emitted on {approve} (factory-level allowance set).
-    event Approval(address indexed token, address indexed owner, uint256 amount);
 
     /// @notice Zero address supplied where a contract is required.
     error InvalidAddress();
     /// @notice Collateral and consideration were the same address.
     error InvalidTokens();
-    /// @notice A value param (strike, expiration, window, decimals, permission mask) is invalid.
+    /// @notice A value param (strike, expiration, window, decimals, salt-array length, permission
+    ///         mask) is invalid.
     error InvalidValue();
     /// @notice Token transferFrom delivered less than `amount` — fee-on-transfer / rebasing tokens are not supported.
     error FeeOnTransferNotSupported();
@@ -76,8 +75,6 @@ interface IFactory {
     /// @notice Deterministic registry key for a set of economic params. Folds in all seven
     ///         {CreateParams} fields; differing in any field yields a different key.
     function optionKey(CreateParams memory p) external pure returns (bytes32);
-    /// @notice Factory-level allowance: how much of `token` the factory may pull from `owner`.
-    function allowance(address token, address owner) external view returns (uint256);
     /// @notice `operator`'s permission bitmask over `owner`'s positions — see {Perm}: TRANSFER (1),
     ///         MINT (2), BURN (4), REDEEM (8), EXERCISE (16). The self entry
     ///         `permissions(account, account)` carries the account's automation opt-ins
@@ -91,10 +88,28 @@ interface IFactory {
     function createOption(CreateParams memory params) external returns (address);
     /// @notice Batch form of {createOption}.
     function createOptions(CreateParams[] memory params) external returns (address[] memory);
-    /// @notice Pull tokens via the factory-level allowance. Only callable by Collateral clones.
+    /// @notice CREATE2 form of {createOption}: the Option and Receipt clones land at addresses derived
+    ///         from `optionSalt` / `receiptSalt`, allowing vanity addresses mined off-chain. Mine
+    ///         `optionSalt` first — the Receipt's init code embeds the resulting Option address.
+    ///         If an economically-identical option already exists, both salts are ignored and the
+    ///         existing address is returned (get-or-create wins).
+    function createOption2(CreateParams memory params, bytes32 optionSalt, bytes32 receiptSalt) external returns (address);
+    /// @notice Batch form of {createOption2}; salt arrays are positional and must match `params` length.
+    function createOptions2(CreateParams[] memory params, bytes32[] memory optionSalts, bytes32[] memory receiptSalts)
+        external
+        returns (address[] memory);
+    /// @notice `keccak256` of the Option clone's CREATE2 init code — mine `optionSalt` against this.
+    ///         Takes no params: the Option clone is a bare EIP-1167 proxy with no immutable args.
+    function optionInitCodeHash() external view returns (bytes32);
+    /// @notice `keccak256` of the Receipt clone's CREATE2 init code for `params` + `option_`. Varies per
+    ///         option (the Receipt bakes its economic params and the Option address into its args).
+    function receiptInitCodeHash(CreateParams memory params, address option_) external view returns (bytes32);
+    /// @notice Address the Option clone lands at for `salt` under {createOption2}.
+    function addressOfOption2(bytes32 salt) external view returns (address);
+    /// @notice Address the Receipt clone lands at for `salt` under {createOption2}, given `option_`.
+    function addressOfReceipt2(CreateParams memory params, address option_, bytes32 salt) external view returns (address);
+    /// @notice Pull tokens via the token's ERC-20 allowance to the factory. Only callable by Receipt clones.
     function transferFrom(address from, address to, uint256 amount, address token) external returns (bool success);
-    /// @notice Set the caller's factory-level allowance for `token`.
-    function approve(address token, uint256 amount) external;
     /// @notice Set `operator`'s permission mask over the caller's positions, overwriting any
     ///         previous mask (`0` revokes everything). Reverts on bits outside `Perm.ALL`.
     ///         `operator == msg.sender` sets the caller's own automation opt-ins.

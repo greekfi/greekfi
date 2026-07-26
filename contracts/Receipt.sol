@@ -15,8 +15,9 @@ import { TokenData } from "./interfaces/IOption.sol";
 import { OptionUtils } from "./OptionUtils.sol";
 import { Perm } from "./Permissions.sol";
 
-/// @dev Narrow view of {Factory} used by {Receipt} to pull collateral/consideration tokens via the
-///      factory's centralised allowance registry.
+/// @dev Narrow view of {Factory} used by {Receipt}: `transferFrom` pulls collateral/consideration
+///      against the token's ERC-20 allowance to the factory, `permissions` gates keeper redeems
+///      (`Perm.REDEEM`), and `owner` gates {sweep}.
 interface IFactory {
     function transferFrom(address from, address to, uint256 amount, address token) external;
     function permissions(address owner, address operator) external view returns (uint256);
@@ -76,9 +77,9 @@ interface IFactory {
  *           offset 111  consDecimals      uint8    (1B)
  */
 contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
-    /// @notice Factory that created this option, used to pull tokens through its Permit2-style
-    ///         allowance registry. Set in the template constructor (= the factory that deployed
-    ///         it) and inherited by every clone via the template's runtime bytecode.
+    /// @notice Factory that created this option, used to pull tokens against their ERC-20
+    ///         allowance to the factory. Set in the template constructor (= the factory that
+    ///         deployed it) and inherited by every clone via the template's runtime bytecode.
     IFactory public immutable factory;
 
     /// @notice Receipt-units the consideration pool can still back at strike rate. Incremented on
@@ -93,11 +94,13 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
 
     /// @notice Thrown when a privileged path is called by anyone other than the paired {Option}.
     error UnauthorizedCaller();
-    /// @notice Thrown when a pre-expiry-only path (mint) runs after expiration.
+    /// @notice Never thrown by Receipt itself — the pre-expiry mint gate is enforced by the paired
+    ///         {Option} (`notExpired` on `mint_`). Declared for ABI/tooling parity.
     error ContractExpired();
     /// @notice Thrown on `amount == 0` (or any derived zero-amount the invariant requires to be positive).
     error ZeroValue();
-    /// @notice Thrown when exercise is attempted after `exerciseDeadline`.
+    /// @notice Never thrown by Receipt itself — the exercise-deadline gate is enforced by the
+    ///         paired {Option} (`canExercise` / `beforeDeadline`). Declared for ABI/tooling parity.
     error ExerciseWindowClosed();
     /// @notice Thrown when a post-window-only path is called before the window closes.
     error ExerciseWindowOpen();
@@ -107,7 +110,7 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
     error BeforeExerciseWindow();
     /// @notice Thrown when {sweep} is called while receipts are still outstanding.
     error OutstandingReceipts();
-    /// @notice Thrown when neither the consideration nor the collateral pool can fully fund the
+    /// @notice Thrown when the consideration or collateral pool cannot fully fund its leg of the
     ///         requested redemption — caller should split into smaller amounts.
     error InsufficientPool();
 
@@ -204,7 +207,7 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
     // ============ MINT ============
 
     /// @notice Mint `amount` Receipt tokens to `account`, pulling the matching amount of
-    ///         underlying collateral through the factory's allowance registry.
+    ///         underlying collateral via the factory (against `account`'s ERC-20 allowance to it).
     /// @dev    Only callable by the paired {Option} contract.
     /// @param account Recipient of the newly-minted Receipt tokens.
     /// @param amount  Collateral-denominated amount.
@@ -216,9 +219,9 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
     // ============ PAIR BURN (called by Option) ============
 
     /// @notice Burn matched Option + Receipt pair, return collateral. Only callable by Option.
-    /// @dev    Trusts Option's own gating: direct `Option.burn` enforces `notExpired`
-    ///         (pre-expiration only), while the auto-burn leg of `Option._settledTransfer` runs
-    ///         under `beforeDeadline` (pre-`exerciseDeadline`). Once everyone is post-settlement,
+    /// @dev    Trusts Option's own gating: direct `Option.burn` and the auto-burn leg of
+    ///         `Option._settledTransfer` both run under `beforeDeadline` (up to and including
+    ///         `exerciseDeadline`). Once everyone is post-settlement,
     ///         all short-side exits must go through `_redeem`.
     /// @param account Recipient of the collateral.
     /// @param amount  Amount of Receipt tokens to burn.
@@ -248,7 +251,8 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
 
     /// @notice Redeem the caller's full Receipt balance.
     /// @dev    Cons-first, FCFS: pays up to `consBacked` receipt-units from the
-    ///         consideration pool at strike rate, callable any time the pool can cover them.
+    ///         consideration pool at strike rate, callable any time the pool can cover them
+    ///         (European: not before `expirationDate` — reverts {BeforeExerciseWindow}).
     ///         Any uncovered remainder is paid 1:1 in collateral **only after** `exerciseDeadline`;
     ///         pre-window, uncovered receipts stay in the caller's balance for later redemption.
     ///
@@ -258,6 +262,35 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
     ///         earlier exercisers paid in, leaving later post-window redeemers with collateral.
     ///         That asymmetry is intentional: it lets shorts lock in the strike-rate exchange
     ///         the moment the pool can fund it, rather than waiting for the window to close.
+    ///
+    ///         ### Writer strategy for American options (read this if you write American)
+    ///
+    ///         The queue is keyed on a current receipt balance and nothing else — receipts carry no
+    ///         mint timestamp and no assignment tag. For an American option the mint window
+    ///         (`block.timestamp < expirationDate`) and this consideration leg overlap, so while
+    ///         `consBacked > 0` **anyone** may mint fresh receipts and join the front of the queue,
+    ///         including someone who never wrote the option and bore no assignment risk. European
+    ///         options are structurally immune: minting stops at `expirationDate` and exercise
+    ///         cannot happen before it, so the two windows never overlap.
+    ///
+    ///         In practice the exposure is small and self-limiting, because it needs all of:
+    ///           1. a *pre-expiry* exercise (the bulk of exercise happens in the post-expiry window,
+    ///              where minting is already closed by `notExpired`, so this attack cannot run);
+    ///           2. only partial exercise (if everyone exercised, the pool is fully claimed anyway);
+    ///           3. spot then falling back below the strike before `expirationDate`.
+    ///
+    ///         The value a latecomer can take is bounded by how far spot round-trips below the
+    ///         strike within the option's remaining life — and since early exercise is only rational
+    ///         close to expiry, that remaining life is usually short and the swing correspondingly
+    ///         small.
+    ///
+    ///         **The mitigation is proactive redemption, and it is available to you at all times.**
+    ///         You already hold receipts, so you are ahead of anyone who must mint first. If spot
+    ///         weakens back through the strike after an exercise, redeem — that is precisely the
+    ///         "buy to close at strike" trade this leg exists to give you, and taking it both locks
+    ///         in your settled cash and empties the pool a latecomer would otherwise draw on.
+    ///         Writers who intend to manage a position rather than hold it passively should monitor
+    ///         `consBacked` and redeem when the consideration leg is the leg they want.
     function redeem() public nonReentrant {
         _redeem(msg.sender, balanceOf(msg.sender));
     }
@@ -326,11 +359,22 @@ contract Receipt is ERC20, ReentrancyGuardTransient, Clone {
     ///         so a single stale entry doesn't brick the batch.
     ///
     ///         Composability-safe by design: a Receipt held inside an ERC4626 vault, Morpho
-    ///         market, or multisig CANNOT be force-unwound by an unauthorised third party
+    ///         market, or multisig CANNOT be force-*redeemed* by an unauthorised third party
     ///         (the previous permissionless `redeem(address)` variants were removed for exactly
     ///         this reason — they let any caller change a vault's collateral balance out from
-    ///         under it).
-    /// @param  holders Holders whose receipts to redeem in full.
+    ///         under it). The auto-burn leg of {Option._settledTransfer} upholds the same principle:
+    ///         it fires only when the receiver has granted `Perm.BURN` to that specific sender, so a
+    ///         held position cannot be altered by an unauthorised party through either route.
+    ///
+    ///         **Reverts are NOT contained.** Only unauthorised and zero-balance holders are
+    ///         skipped. Anything that makes `_redeem` itself revert — `ExerciseWindowOpen` when the
+    ///         consideration pool is empty pre-window, `BeforeExerciseWindow` on a European option,
+    ///         `InsufficientPool`, or a duplicate holder in the list — aborts the WHOLE batch and
+    ///         rolls back the holders already processed. Because the cons leg is FCFS, the pool
+    ///         empties partway down any long list, so a pre-window batch reverting is the ordinary
+    ///         outcome rather than an edge case. Callers should size batches accordingly, or call
+    ///         {redeem} per holder if partial progress matters.
+    /// @param  holders Holders whose receipts to redeem in full. Must not contain duplicates.
     function redeemFor(address[] calldata holders) external nonReentrant {
         for (uint256 i = 0; i < holders.length; i++) {
             address h = holders[i];
