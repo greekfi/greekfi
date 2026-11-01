@@ -110,7 +110,12 @@ contract PositionRouter {
     ///         `minMakerAmount` USDC. The maker settles it with `settleSingle(order, makerSig, 0,
     ///         OldSingleQuote(false, minMakerAmount, order.maker_nonce), "")` and `order.flags`
     ///         signature type 1 (EIP-1271). The maker may raise `maker_amount`; any other change
-    ///         breaks the hash. Bebop burns the maker nonce on fill, so the signature works once.
+    ///         breaks the hash. The submitter picks the fill size (`filledTakerAmount` is in neither
+    ///         signature): anything up to `order.taker_amount`, with the premium scaled pro-rata and
+    ///         rounded down, so a dust fill can pay zero. The first fill of any size spends the maker
+    ///         nonce, so the signature fills once. To survive partial fills, sign several orders on
+    ///         fresh nonces and set the Safe's collateral approval to the factory to the intended
+    ///         size: the approval, not the orders, then caps how much can mint.
     /// @param validDuration Upper bound on `order.expiry - now`, for the Roles Modifier to cap.
     function signOrder(IBebopSettlement.SingleOrder calldata order, uint256 minMakerAmount, uint32 validDuration) external {
         if (

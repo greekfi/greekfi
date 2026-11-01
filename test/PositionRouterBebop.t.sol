@@ -127,12 +127,52 @@ contract PositionRouterBebopTest is Test {
         assertFalse(_fromRoles(abi.encodeCall(router.signOrder, (order, PREMIUM, 30 minutes))), "sign must fail");
     }
 
+    /// @notice The submitter picks the fill size; the premium scales pro-rata, and the first fill of
+    ///         any size spends the maker nonce, so the rest of the order can never fill.
+    function testFork_PartialFillSpendsTheOrder() public {
+        IBebopSettlement.SingleOrder memory order = _order(PREMIUM);
+        assertTrue(_fromRoles(abi.encodeCall(router.signOrder, (order, PREMIUM, 30 minutes))), "sign");
+        uint256 usdcBefore = USDC.balanceOf(SAFE);
+
+        _settleFill(order, 4 ether);
+
+        assertEq(option.balanceOf(maker), 4 ether, "partial fill");
+        assertEq(USDC.balanceOf(SAFE) - usdcBefore, PREMIUM * 4 / 10, "pro-rata premium");
+        _settleExpectingRevert(order, 0, abi.encodeWithSignature("InvalidNonce()"));
+    }
+
+    /// @notice The Safe's WETH approval to the factory caps what any number of pre-signed orders can
+    ///         mint. setUp approves exactly AMOUNT, so two orders of AMOUNT each fill 4 + 6 and a
+    ///         third order cannot mint anything.
+    function testFork_ApprovalCapsPreSignedOrders() public {
+        IBebopSettlement.SingleOrder memory first = _order(PREMIUM, 1);
+        IBebopSettlement.SingleOrder memory second = _order(PREMIUM, 2);
+        IBebopSettlement.SingleOrder memory third = _order(PREMIUM, 3);
+        assertTrue(_fromRoles(abi.encodeCall(router.signOrder, (first, PREMIUM, 30 minutes))), "sign 1");
+        assertTrue(_fromRoles(abi.encodeCall(router.signOrder, (second, PREMIUM, 30 minutes))), "sign 2");
+        assertTrue(_fromRoles(abi.encodeCall(router.signOrder, (third, PREMIUM, 30 minutes))), "sign 3");
+        uint256 usdcBefore = USDC.balanceOf(SAFE);
+
+        _settleFill(first, 4 ether);
+        _settleFill(second, 6 ether);
+        // The auto-mint's WETH pull fails on the spent approval; Bebop wraps it.
+        _settleExpectingRevert(third, 1 ether, bytes("SafeERC20: low-level call failed"));
+
+        assertEq(option.balanceOf(maker), AMOUNT, "filled up to the approval");
+        assertEq(USDC.balanceOf(SAFE) - usdcBefore, PREMIUM, "premium for the whole amount");
+        assertEq(WETH.allowance(SAFE, address(FACTORY)), 0, "approval spent");
+    }
+
     function _order(uint256 makerAmount) internal view returns (IBebopSettlement.SingleOrder memory) {
+        return _order(makerAmount, 1);
+    }
+
+    function _order(uint256 makerAmount, uint256 nonce) internal view returns (IBebopSettlement.SingleOrder memory) {
         return IBebopSettlement.SingleOrder({
             expiry: block.timestamp + 30 minutes,
             taker_address: SAFE,
             maker_address: maker,
-            maker_nonce: 1,
+            maker_nonce: nonce,
             taker_token: address(option),
             maker_token: address(USDC),
             taker_amount: AMOUNT,
@@ -149,19 +189,39 @@ contract PositionRouterBebopTest is Test {
         return ISafe(SAFE).execTransactionFromModule(address(router), 0, data, DELEGATECALL);
     }
 
-    /// @dev The maker signs its own side and submits; the Safe's taker signature is the empty bytes.
-    ///      Without a matching `signedMessages` entry the Safe's fallback handler reverts the whole
-    ///      settlement with "Hash not approved".
+    /// @dev The maker signs its own side and submits a full fill; the Safe's taker signature is the
+    ///      empty bytes. Without a matching `signedMessages` entry the Safe's fallback handler reverts
+    ///      the whole settlement with "Hash not approved".
     function _settle(IBebopSettlement.SingleOrder memory order, bool expectUnapproved) internal {
-        bytes32 makerHash = IBebopSettlement(BEBOP).hashSingleOrder(order, 0, 0, 0);
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(MAKER_KEY, makerHash);
-        if (expectUnapproved) vm.expectRevert(bytes("Hash not approved"));
+        if (expectUnapproved) _settleExpectingRevert(order, 0, bytes("Hash not approved"));
+        else _settleFill(order, 0);
+    }
+
+    /// @dev `filled` is the submitter's choice and in neither signature; 0 means the full order.
+    function _settleFill(IBebopSettlement.SingleOrder memory order, uint256 filled) internal {
+        bytes memory makerSig = _makerSig(order);
         vm.prank(maker);
+        _submit(order, makerSig, filled);
+    }
+
+    function _settleExpectingRevert(IBebopSettlement.SingleOrder memory order, uint256 filled, bytes memory reason) internal {
+        bytes memory makerSig = _makerSig(order);
+        vm.expectRevert(reason);
+        vm.prank(maker);
+        _submit(order, makerSig, filled);
+    }
+
+    function _makerSig(IBebopSettlement.SingleOrder memory order) internal view returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(MAKER_KEY, IBebopSettlement(BEBOP).hashSingleOrder(order, 0, 0, 0));
+        return abi.encodePacked(r, s, v);
+    }
+
+    function _submit(IBebopSettlement.SingleOrder memory order, bytes memory makerSig, uint256 filled) internal {
         IBebopSettlement(BEBOP)
             .settleSingle(
                 order,
-                IBebopSettlement.MakerSignature(abi.encodePacked(r, s, v), 0),
-                0,
+                IBebopSettlement.MakerSignature(makerSig, 0),
+                filled,
                 IBebopSettlement.OldSingleQuote(false, PREMIUM, order.maker_nonce),
                 ""
             );
