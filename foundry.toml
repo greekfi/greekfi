@@ -7,14 +7,12 @@ optimizer = true
 optimizer_runs = 200
 solc = "0.8.35"
 evm_version = "osaka"
-# Mainnet size limits don't apply to template contracts cloned at runtime.
-ignored_error_codes = [3860, 5574]
 
 [lint]
 exclude_lints = ["unsafe-cheatcode", "unwrapped-modifier-logic", "unsafe-typecast"]
 
 [fmt]
-line_length = 130
+line_length = 140
 tab_width = 4
 quote_style = "double"
 bracket_spacing = true
