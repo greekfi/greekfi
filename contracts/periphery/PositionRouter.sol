@@ -143,8 +143,9 @@ contract PositionRouter is IPositionRouter {
         IBebopSettlement.SingleOrder calldata quote,
         IBebopSettlement.MakerSignature calldata makerSignature
     ) private returns (uint256 premium) {
-        uint256 usdcBefore = IERC20(USDC).balanceOf(account);
+        // Read after the mint: a put's collateral is USDC too, and must not count against the premium.
         order.option.transferFrom(account, address(this), order.amount);
+        uint256 usdcBefore = IERC20(USDC).balanceOf(account);
         order.option.approve(address(BEBOP), order.amount);
         BEBOP.swapSingle(quote, makerSignature, 0);
 
