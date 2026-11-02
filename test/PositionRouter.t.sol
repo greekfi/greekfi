@@ -8,6 +8,7 @@ import { CreateParams, IFactory } from "../contracts/interfaces/IFactory.sol";
 import { IOption } from "../contracts/interfaces/IOption.sol";
 import { IReceipt } from "../contracts/interfaces/IReceipt.sol";
 import { IBebopSettlement } from "../contracts/interfaces/IBebopSettlement.sol";
+import { IPositionRouter } from "../contracts/interfaces/IPositionRouter.sol";
 import { PositionRouter } from "../contracts/periphery/PositionRouter.sol";
 
 /// @dev Claims a real market's Receipt as its own, to probe the router's back-pointer check.
@@ -19,7 +20,7 @@ contract FakeOption {
     }
 }
 
-/// @notice The router's mint / burn / transfer / redeem and order book against the deployed v1.3 factory on a mainnet fork.
+/// @notice The router's transfer / redeem and order book against the deployed v1.3 factory on a mainnet fork.
 contract PositionRouterTest is Test {
     IFactory constant FACTORY = IFactory(0x9999999999906A9a5B3CFB1151Ac6812B3042191); // v1.3
     address constant BEBOP = 0xbbbbbBB520d69a9775E85b458C58c648259FAD5F;
@@ -29,9 +30,8 @@ contract PositionRouterTest is Test {
     // `Perm` bits from the v1.3 factory (greekfi/contracts c7200d4, contracts/Permissions.sol).
     uint256 constant TRANSFER = 1 << 0;
     uint256 constant MINT = 1 << 1;
-    uint256 constant BURN = 1 << 2;
     uint256 constant REDEEM = 1 << 3;
-    uint256 constant ALL_ROUTER_BITS = MINT | BURN | REDEEM;
+    uint256 constant ALL_ROUTER_BITS = TRANSFER | MINT | REDEEM;
 
     PositionRouter router;
     IOption opt;
@@ -56,30 +56,50 @@ contract PositionRouterTest is Test {
         }
     }
 
-    function testFork_Mint_OpensBothLegsForCaller() public {
-        _grant(alice, MINT);
-        uint256 wethBefore = WETH.balanceOf(alice);
+    function testFork_Transfer_MintsShortfallAndKeepsReceipts() public {
+        _grant(alice, TRANSFER | MINT);
+        _mint(opt, alice, 4 ether);
 
         vm.prank(alice);
-        router.mint(_opts(opt), _amts(10 ether));
+        router.transfer(_opts(opt), bob, _amts(10 ether));
 
-        assertEq(opt.balanceOf(alice), 10 ether, "option");
-        assertEq(rct.balanceOf(alice), 10 ether, "receipt");
-        assertEq(wethBefore - WETH.balanceOf(alice), 10 ether, "collateral paid");
-        assertEq(opt.balanceOf(address(router)), 0, "router holds nothing");
+        assertEq(opt.balanceOf(bob), 10 ether, "bob holds the options");
+        assertEq(opt.balanceOf(alice), 0, "alice sent her own first");
+        assertEq(rct.balanceOf(alice), 10 ether, "alice keeps every receipt");
     }
 
-    function testFork_Burn_ReturnsCollateralToCaller() public {
-        _grant(alice, BURN);
-        _mint(opt, alice, 10 ether);
+    /// @notice One call writes and sends across two markets; one later call redeems both.
+    function testFork_Batch_SpansMarkets() public {
+        _grant(alice, ALL_ROUTER_BITS);
+        (IOption opt2, IReceipt rct2) = _newOption(3_500e18, false);
         uint256 wethBefore = WETH.balanceOf(alice);
 
         vm.prank(alice);
-        router.burn(_opts(opt), _amts(4 ether));
+        router.transfer(_opts(opt, opt2), bob, _amts(10 ether, 5 ether));
 
-        assertEq(opt.balanceOf(alice), 6 ether, "option");
-        assertEq(rct.balanceOf(alice), 6 ether, "receipt");
-        assertEq(WETH.balanceOf(alice) - wethBefore, 4 ether, "collateral back");
+        assertEq(opt.balanceOf(bob) + opt2.balanceOf(bob), 15 ether, "bob holds both");
+        assertEq(wethBefore - WETH.balanceOf(alice), 15 ether, "collateral locked");
+
+        vm.warp(rct.exerciseDeadline() + 1);
+        vm.prank(alice);
+        router.redeem(_opts(opt, opt2));
+
+        assertEq(rct.balanceOf(alice) + rct2.balanceOf(alice), 0, "both redeemed");
+        assertEq(WETH.balanceOf(alice), wethBefore, "all collateral back");
+    }
+
+    function testFork_Transfer_RejectsLengthMismatch() public {
+        _grant(alice, ALL_ROUTER_BITS);
+        vm.prank(alice);
+        vm.expectRevert(IPositionRouter.LengthMismatch.selector);
+        router.transfer(_opts(opt), bob, _amts(1 ether, 1 ether));
+    }
+
+    function testFork_Transfer_RequiresGrant() public {
+        _mint(opt, alice, 1 ether);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSignature("ERC20InsufficientAllowance(address,uint256,uint256)", address(router), 0, 1 ether));
+        router.transfer(_opts(opt), bob, _amts(1 ether));
     }
 
     function testFork_Redeem_PaysCallerAfterPartialExercise() public {
@@ -102,39 +122,6 @@ contract PositionRouterTest is Test {
         assertEq(WETH.balanceOf(alice) - wethBefore, 6 ether, "unexercised collateral");
     }
 
-    /// @notice One call mints, burns and later redeems across two markets.
-    function testFork_Batch_SpansMarkets() public {
-        _grant(alice, ALL_ROUTER_BITS);
-        (IOption opt2, IReceipt rct2) = _newOption(3_500e18, false);
-        uint256 wethBefore = WETH.balanceOf(alice);
-
-        vm.startPrank(alice);
-        router.mint(_opts(opt, opt2), _amts(10 ether, 5 ether));
-        router.burn(_opts(opt, opt2), _amts(4 ether, 1 ether));
-        vm.stopPrank();
-
-        assertEq(rct.balanceOf(alice), 6 ether, "receipt 1");
-        assertEq(rct2.balanceOf(alice), 4 ether, "receipt 2");
-        assertEq(wethBefore - WETH.balanceOf(alice), 10 ether, "net collateral locked");
-
-        vm.warp(rct.exerciseDeadline() + 1);
-        vm.prank(alice);
-        router.redeem(_opts(opt, opt2));
-
-        assertEq(rct.balanceOf(alice) + rct2.balanceOf(alice), 0, "both redeemed");
-        assertEq(WETH.balanceOf(alice), wethBefore, "all collateral back");
-    }
-
-    function testFork_MintAndBurn_RejectLengthMismatch() public {
-        _grant(alice, ALL_ROUTER_BITS);
-        vm.startPrank(alice);
-        vm.expectRevert(PositionRouter.LengthMismatch.selector);
-        router.mint(_opts(opt), _amts(1 ether, 1 ether));
-        vm.expectRevert(PositionRouter.LengthMismatch.selector);
-        router.burn(_opts(opt), _amts(1 ether, 1 ether));
-        vm.stopPrank();
-    }
-
     function testFork_Redeem_WithoutGrantIsSilentNoOp() public {
         _mint(opt, alice, 10 ether);
         vm.warp(rct.exerciseDeadline() + 1);
@@ -145,28 +132,20 @@ contract PositionRouterTest is Test {
         assertEq(rct.balanceOf(alice), 10 ether, "nothing redeemed");
     }
 
-    function testFork_MintAndBurn_RequireGrant() public {
-        _mint(opt, alice, 1 ether);
-        vm.startPrank(alice);
-        vm.expectRevert(IOption.Unauthorized.selector);
-        router.mint(_opts(opt), _amts(1 ether));
-        vm.expectRevert(IOption.Unauthorized.selector);
-        router.burn(_opts(opt), _amts(1 ether));
-        vm.stopPrank();
-    }
-
     /// @notice A third party calling the router acts only on itself, even when the victim has
     ///         granted the router every bit it uses.
     function testFork_ThirdPartyCannotTouchGrantorPosition() public {
         _grant(alice, ALL_ROUTER_BITS);
         _mint(opt, alice, 10 ether);
-        vm.warp(rct.exerciseDeadline() + 1);
 
-        vm.startPrank(mallory);
+        vm.prank(mallory);
+        // mallory never granted the router, so it can only ever reach mallory's own tokens.
+        vm.expectRevert(abi.encodeWithSignature("ERC20InsufficientAllowance(address,uint256,uint256)", address(router), 0, 1 ether));
+        router.transfer(_opts(opt), mallory, _amts(1 ether));
+
+        vm.warp(rct.exerciseDeadline() + 1);
+        vm.prank(mallory);
         router.redeem(_opts(opt));
-        vm.expectRevert(IOption.Unauthorized.selector);
-        router.burn(_opts(opt), _amts(1 ether));
-        vm.stopPrank();
 
         assertEq(opt.balanceOf(alice), 10 ether, "option untouched");
         assertEq(rct.balanceOf(alice), 10 ether, "receipt untouched");
@@ -179,36 +158,13 @@ contract PositionRouterTest is Test {
         IOption unregistered = IOption(address(new FakeOption(address(0xdead))));
 
         vm.startPrank(alice);
-        vm.expectRevert(PositionRouter.UnknownOption.selector);
-        router.mint(_opts(opt, impostor), _amts(1 ether, 1 ether));
-        vm.expectRevert(PositionRouter.UnknownOption.selector);
+        vm.expectRevert(IPositionRouter.UnknownOption.selector);
+        router.transfer(_opts(opt, impostor), bob, _amts(1 ether, 1 ether));
+        vm.expectRevert(IPositionRouter.UnknownOption.selector);
         router.redeem(_opts(unregistered));
         vm.stopPrank();
 
-        assertEq(opt.balanceOf(alice), 0, "first leg rolled back");
-    }
-
-    function testFork_Transfer_MintsShortfallAndKeepsReceipts() public {
-        _grant(alice, TRANSFER | MINT);
-        _mint(opt, alice, 4 ether);
-
-        vm.prank(alice);
-        router.transfer(_opts(opt), bob, _amts(10 ether));
-
-        assertEq(opt.balanceOf(bob), 10 ether, "bob holds the options");
-        assertEq(opt.balanceOf(alice), 0, "alice sent her own first");
-        assertEq(rct.balanceOf(alice), 10 ether, "alice keeps every receipt");
-    }
-
-    function testFork_Transfer_MovesOnlyCallerOptions() public {
-        _grant(alice, TRANSFER | MINT);
-        _mint(opt, alice, 10 ether);
-
-        vm.prank(mallory);
-        vm.expectRevert();
-        router.transfer(_opts(opt), mallory, _amts(1 ether));
-
-        assertEq(opt.balanceOf(alice), 10 ether, "alice untouched");
+        assertEq(opt.balanceOf(bob), 0, "first leg rolled back");
     }
 
     function testFork_CreateOrder_StoresAndCancels() public {
@@ -222,13 +178,13 @@ contract PositionRouterTest is Test {
         assertEq(amount, 1 ether, "amount");
         assertEq(minPremium, 100e6, "min premium");
 
-        vm.expectRevert(PositionRouter.InvalidOrder.selector);
+        vm.expectRevert(IPositionRouter.InvalidOrder.selector);
         router.createOrder(7, euro, 1 ether, 100e6, 10 minutes);
 
         router.cancelOrder(7);
         (,, amount,) = router.orders(alice, 7);
         assertEq(amount, 0, "cancelled");
-        vm.expectRevert(PositionRouter.UnknownOrder.selector);
+        vm.expectRevert(IPositionRouter.UnknownOrder.selector);
         router.cancelOrder(7);
         vm.stopPrank();
     }
@@ -238,11 +194,11 @@ contract PositionRouterTest is Test {
         IOption impostor = IOption(address(new FakeOption(address(rct))));
 
         vm.startPrank(alice);
-        vm.expectRevert(PositionRouter.MarketNotAllowed.selector);
+        vm.expectRevert(IPositionRouter.MarketNotAllowed.selector);
         router.createOrder(1, opt, 1 ether, 100e6, 10 minutes); // American
-        vm.expectRevert(PositionRouter.MarketNotAllowed.selector);
+        vm.expectRevert(IPositionRouter.MarketNotAllowed.selector);
         router.createOrder(1, longDated, 1 ether, 100e6, 10 minutes);
-        vm.expectRevert(PositionRouter.UnknownOption.selector);
+        vm.expectRevert(IPositionRouter.UnknownOption.selector);
         router.createOrder(1, impostor, 1 ether, 100e6, 10 minutes);
         vm.stopPrank();
     }

@@ -7,16 +7,17 @@ import { IFactory } from "../interfaces/IFactory.sol";
 import { IOption } from "../interfaces/IOption.sol";
 import { IReceipt } from "../interfaces/IReceipt.sol";
 import { IBebopSettlement } from "../interfaces/IBebopSettlement.sol";
+import { IPositionRouter } from "../interfaces/IPositionRouter.sol";
 
 /**
- * @title  PositionRouter: one fixed address for a writer's mint, burn, transfer, redeem and Bebop limit orders
+ * @title  PositionRouter: one fixed address for a writer's transfer, redeem and Bebop limit orders
  * @notice DEMO ONLY. Not audited, not deployed, outside the audit scope in `auditors-instructions.md`.
  *
  *         Every market is its own Option/Receipt clone pair, so an account whose call permissions are
  *         scoped by target address (a Safe behind a Zodiac Roles Modifier, say) would need a new
  *         permission for every series it writes. This router gives that account one fixed target.
  *
- *         {mint}, {burn}, {transfer} and {redeem} take a list of markets, validate that each belongs to
+ *         {transfer} and {redeem} take a list of markets, validate that each belongs to
  *         {FACTORY}, then act on `msg.sender`'s own position only.
  *
  *         {createOrder} stores a limit order to sell freshly written options for at least a minimum
@@ -25,10 +26,10 @@ import { IBebopSettlement } from "../interfaces/IBebopSettlement.sol";
  *         straight to the account. The router holds the options only inside that call.
  *
  *         Setup: approve collateral to the factory (the approval caps what all orders can write), then
- *         `factory.setPermissions(router, TRANSFER | MINT | BURN | REDEEM)`. With MINT, {transfer}
+ *         `factory.setPermissions(router, TRANSFER | MINT | REDEEM)`. With MINT, {transfer}
  *         writes and sends options to any `to`, so a Roles preset must pin `to`.
  */
-contract PositionRouter {
+contract PositionRouter is IPositionRouter {
     struct Order {
         IOption option;
         uint40 deadline;
@@ -51,27 +52,6 @@ contract PositionRouter {
     /// @notice Open limit orders by account and account-chosen nonce.
     mapping(address account => mapping(uint256 nonce => Order)) public orders;
 
-    /// @notice `option` was not created by {FACTORY}.
-    error UnknownOption();
-    /// @notice `options` and `amounts` differ in length.
-    error LengthMismatch();
-    /// @notice The order's market breaks the order rules.
-    error MarketNotAllowed();
-    /// @notice Zero amount or premium, or the nonce already holds an open order.
-    error InvalidOrder();
-    /// @notice No open order at this account and nonce.
-    error UnknownOrder();
-    /// @notice The order's deadline has passed.
-    error OrderExpired();
-    /// @notice The quote does not sell exactly this order to the router for USDC paid to the account.
-    error QuoteMismatch();
-    /// @notice The account received less USDC than the order's minimum premium.
-    error PremiumTooLow();
-
-    event OrderCreated(address indexed account, uint256 indexed nonce, IOption option, uint256 amount, uint256 minPremium, uint40 deadline);
-    event OrderCancelled(address indexed account, uint256 indexed nonce);
-    event OrderFilled(address indexed account, uint256 indexed nonce, address indexed maker, uint256 premium);
-
     constructor(IFactory factory_, IBebopSettlement bebop_, address weth_, address usdc_, uint256 maxTenor_, uint256 maxWindow_) {
         FACTORY = factory_;
         BEBOP = bebop_;
@@ -79,27 +59,6 @@ contract PositionRouter {
         USDC = usdc_;
         MAX_TENOR = maxTenor_;
         MAX_WINDOW = maxWindow_;
-    }
-
-    /// @notice For each `i`, mint `amounts[i]` of `options[i]` for the caller, paid from the caller's
-    ///         factory collateral allowance. The caller receives both the Option and the Receipt.
-    ///         Needs `Perm.MINT`.
-    function mint(IOption[] calldata options, uint256[] calldata amounts) external {
-        if (options.length != amounts.length) revert LengthMismatch();
-        for (uint256 i; i < options.length; ++i) {
-            _receiptOf(options[i]);
-            options[i].mint(msg.sender, amounts[i]);
-        }
-    }
-
-    /// @notice For each `i`, pair-burn `amounts[i]` of the caller's matched Option + Receipt in
-    ///         `options[i]`'s market; collateral returns to the caller. Needs `Perm.BURN`.
-    function burn(IOption[] calldata options, uint256[] calldata amounts) external {
-        if (options.length != amounts.length) revert LengthMismatch();
-        for (uint256 i; i < options.length; ++i) {
-            _receiptOf(options[i]);
-            options[i].burn(msg.sender, amounts[i]);
-        }
     }
 
     /// @notice For each `i`, send `amounts[i]` of the caller's `options[i]` to `to`. Needs

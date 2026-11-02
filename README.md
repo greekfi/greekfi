@@ -28,9 +28,10 @@ contracts/
 │   ├── IOption.sol           # Long side (ERC-20): mint / exercise / pair-burn / expire
 │   ├── IReceipt.sol          # Short side (ERC-20): holds collateral, redeem
 │   ├── IBebopSettlement.sol  # Slice of Bebop's settlement contract used by the router
-│   └── ISafe.sol             # Slice of Safe 1.3.0 used by the router
+│   ├── IPositionRouter.sol   # Errors and events of the router demo
+│   └── ISafe.sol             # Slice of Safe 1.3.0 used by the fork tests
 └── periphery/
-    └── PositionRouter.sol    # DEMO: fixed-target mint / burn / transfer / redeem and Bebop limit orders for a Safe
+    └── PositionRouter.sol    # DEMO: fixed-target transfer / redeem and Bebop limit orders for a Safe
 test/                         # Mainnet-fork tests against the deployed v1.3 factory, Bebop and the ENS Endowment Safe
 ```
 

@@ -8,6 +8,7 @@ import { CreateParams, IFactory } from "../contracts/interfaces/IFactory.sol";
 import { IOption } from "../contracts/interfaces/IOption.sol";
 import { IBebopSettlement } from "../contracts/interfaces/IBebopSettlement.sol";
 import { ISafe } from "../contracts/interfaces/ISafe.sol";
+import { IPositionRouter } from "../contracts/interfaces/IPositionRouter.sol";
 import { PositionRouter } from "../contracts/periphery/PositionRouter.sol";
 
 /// @notice Mainnet-fork proof that the ENS Endowment Safe can post a limit order through its Roles
@@ -106,14 +107,14 @@ contract PositionRouterBebopTest is Test {
 
     function testFork_PremiumBelowMinimumReverts() public {
         _createOrder(NONCE, PREMIUM, 1 days);
-        _submitExpectingRevert(NONCE, _quote(PREMIUM - 1), abi.encodeWithSelector(PositionRouter.PremiumTooLow.selector));
+        _submitExpectingRevert(NONCE, _quote(PREMIUM - 1), abi.encodeWithSelector(IPositionRouter.PremiumTooLow.selector));
     }
 
     /// @notice A quote must sell exactly the stored order to the router and pay the Safe: no partial
     ///         size, no other receiver, no other taker.
     function testFork_MismatchedQuotesRevert() public {
         _createOrder(NONCE, PREMIUM, 1 days);
-        bytes memory mismatch = abi.encodeWithSelector(PositionRouter.QuoteMismatch.selector);
+        bytes memory mismatch = abi.encodeWithSelector(IPositionRouter.QuoteMismatch.selector);
 
         IBebopSettlement.SingleOrder memory quote = _quote(PREMIUM);
         quote.taker_amount = AMOUNT / 1e9;
@@ -134,21 +135,21 @@ contract PositionRouterBebopTest is Test {
 
         IBebopSettlement.SingleOrder memory again = _quote(PREMIUM);
         again.maker_nonce = 2;
-        _submitExpectingRevert(NONCE, again, abi.encodeWithSelector(PositionRouter.UnknownOrder.selector));
+        _submitExpectingRevert(NONCE, again, abi.encodeWithSelector(IPositionRouter.UnknownOrder.selector));
     }
 
     function testFork_CancelledOrderCannotFill() public {
         _createOrder(NONCE, PREMIUM, 1 days);
         assertTrue(_fromRoles(abi.encodeCall(router.cancelOrder, (NONCE))), "cancel");
 
-        _submitExpectingRevert(NONCE, _quote(PREMIUM), abi.encodeWithSelector(PositionRouter.UnknownOrder.selector));
+        _submitExpectingRevert(NONCE, _quote(PREMIUM), abi.encodeWithSelector(IPositionRouter.UnknownOrder.selector));
     }
 
     function testFork_ExpiredOrderCannotFill() public {
         _createOrder(NONCE, PREMIUM, 1 hours);
         vm.warp(block.timestamp + 1 hours + 1);
 
-        _submitExpectingRevert(NONCE, _quote(PREMIUM), abi.encodeWithSelector(PositionRouter.OrderExpired.selector));
+        _submitExpectingRevert(NONCE, _quote(PREMIUM), abi.encodeWithSelector(IPositionRouter.OrderExpired.selector));
     }
 
     /// @notice The Safe's WETH approval to the factory caps what all its orders can write: setUp
