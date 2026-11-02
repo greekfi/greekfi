@@ -30,13 +30,6 @@ import { IPositionRouter } from "../interfaces/IPositionRouter.sol";
  *         writes and sends options to any `to`, so a Roles preset must pin `to`.
  */
 contract PositionRouter is IPositionRouter {
-    struct Order {
-        IOption option;
-        uint40 deadline;
-        uint256 amount;
-        uint256 minPremium;
-    }
-
     /// @notice The factory whose markets this router accepts.
     IFactory public immutable FACTORY;
     /// @notice Bebop settlement contract that {submitOrder} settles on.
@@ -44,28 +37,21 @@ contract PositionRouter is IPositionRouter {
     /// @notice The two tokens an order's market may pair, and the premium token is {USDC}.
     address public immutable WETH;
     address public immutable USDC;
-    /// @notice Longest time to expiration an order's market may have.
-    uint256 public immutable MAX_TENOR;
-    /// @notice Longest post-expiry exercise window an order's market may have.
-    uint256 public immutable MAX_WINDOW;
 
     /// @notice Open limit orders by account and account-chosen nonce.
     mapping(address account => mapping(uint256 nonce => Order)) public orders;
 
-    constructor(IFactory factory_, IBebopSettlement bebop_, address weth_, address usdc_, uint256 maxTenor_, uint256 maxWindow_) {
+    constructor(IFactory factory_, IBebopSettlement bebop_, address weth_, address usdc_) {
         FACTORY = factory_;
         BEBOP = bebop_;
         WETH = weth_;
         USDC = usdc_;
-        MAX_TENOR = maxTenor_;
-        MAX_WINDOW = maxWindow_;
     }
 
     /// @notice For each `i`, send `amounts[i]` of the caller's `options[i]` to `to`. Needs
     ///         `Perm.TRANSFER`; with `Perm.MINT` too, any shortfall is minted from the caller's
     ///         collateral allowance and the caller keeps the Receipts.
     function transfer(IOption[] calldata options, address to, uint256[] calldata amounts) external {
-        if (options.length != amounts.length) revert LengthMismatch();
         for (uint256 i; i < options.length; ++i) {
             _receiptOf(options[i]);
             options[i].transferFrom(msg.sender, to, amounts[i]);
@@ -85,8 +71,8 @@ contract PositionRouter is IPositionRouter {
     }
 
     /// @notice Offer to write and sell `amount` of `option` for at least `minPremium` USDC in total,
-    ///         until `duration` seconds from now. The market must be European, pair {WETH} with {USDC},
-    ///         and fit {MAX_TENOR} and {MAX_WINDOW}.
+    ///         until `duration` seconds from now. The market must be European and pair {WETH} with
+    ///         {USDC}.
     /// @param duration Lifetime of the order, for the Roles Modifier to cap.
     function createOrder(uint256 nonce, IOption option, uint256 amount, uint256 minPremium, uint32 duration) external {
         if (amount == 0 || minPremium == 0 || orders[msg.sender][nonce].amount != 0) revert InvalidOrder();
@@ -94,11 +80,7 @@ contract PositionRouter is IPositionRouter {
         IReceipt receipt = _receiptOf(option);
         address coll = address(receipt.collateral());
         address cons = address(receipt.consideration());
-        if (
-            !receipt.isEuro() || receipt.expirationDate() > block.timestamp + MAX_TENOR
-                || receipt.exerciseDeadline() - receipt.expirationDate() > MAX_WINDOW
-                || !((coll == WETH && cons == USDC) || (coll == USDC && cons == WETH))
-        ) revert MarketNotAllowed();
+        if (!receipt.isEuro() || !((coll == WETH && cons == USDC) || (coll == USDC && cons == WETH))) revert MarketNotAllowed();
 
         uint40 deadline = uint40(block.timestamp + duration);
         orders[msg.sender][nonce] = Order(option, deadline, amount, minPremium);
@@ -107,7 +89,6 @@ contract PositionRouter is IPositionRouter {
 
     /// @notice Withdraw the caller's open order at `nonce`.
     function cancelOrder(uint256 nonce) external {
-        if (orders[msg.sender][nonce].amount == 0) revert UnknownOrder();
         delete orders[msg.sender][nonce];
         emit OrderCancelled(msg.sender, nonce);
     }

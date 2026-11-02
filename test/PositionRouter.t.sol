@@ -42,7 +42,7 @@ contract PositionRouterTest is Test {
 
     function setUp() public {
         vm.createSelectFork(vm.envOr("ETH_RPC_URL", string("https://ethereum-rpc.publicnode.com")));
-        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC), 30 days, 1 hours);
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC));
         (opt, rct) = _newOption(3_000e18, false);
 
         address[3] memory who = [alice, bob, mallory];
@@ -86,13 +86,6 @@ contract PositionRouterTest is Test {
 
         assertEq(rct.balanceOf(alice) + rct2.balanceOf(alice), 0, "both redeemed");
         assertEq(WETH.balanceOf(alice), wethBefore, "all collateral back");
-    }
-
-    function testFork_Transfer_RejectsLengthMismatch() public {
-        _grant(alice, ALL_ROUTER_BITS);
-        vm.prank(alice);
-        vm.expectRevert(IPositionRouter.LengthMismatch.selector);
-        router.transfer(_opts(opt), bob, _amts(1 ether, 1 ether));
     }
 
     function testFork_Transfer_RequiresGrant() public {
@@ -184,36 +177,27 @@ contract PositionRouterTest is Test {
         router.cancelOrder(7);
         (,, amount,) = router.orders(alice, 7);
         assertEq(amount, 0, "cancelled");
-        vm.expectRevert(IPositionRouter.UnknownOrder.selector);
-        router.cancelOrder(7);
         vm.stopPrank();
     }
 
     function testFork_CreateOrder_RejectsDisallowedMarkets() public {
-        (IOption longDated,) = _newOption(3_000e18, true, 60 days);
         IOption impostor = IOption(address(new FakeOption(address(rct))));
 
         vm.startPrank(alice);
         vm.expectRevert(IPositionRouter.MarketNotAllowed.selector);
         router.createOrder(1, opt, 1 ether, 100e6, 10 minutes); // American
-        vm.expectRevert(IPositionRouter.MarketNotAllowed.selector);
-        router.createOrder(1, longDated, 1 ether, 100e6, 10 minutes);
         vm.expectRevert(IPositionRouter.UnknownOption.selector);
         router.createOrder(1, impostor, 1 ether, 100e6, 10 minutes);
         vm.stopPrank();
     }
 
     function _newOption(uint256 strike, bool isEuro) internal returns (IOption option, IReceipt receipt) {
-        return _newOption(strike, isEuro, 1 days);
-    }
-
-    function _newOption(uint256 strike, bool isEuro, uint256 tenor) internal returns (IOption option, IReceipt receipt) {
         option = IOption(
             FACTORY.createOption(
                 CreateParams({
                     collateral: address(WETH),
                     consideration: address(USDC),
-                    expirationDate: uint40(block.timestamp + tenor),
+                    expirationDate: uint40(block.timestamp + 1 days),
                     strike: strike,
                     isPut: false,
                     isEuro: isEuro,

@@ -3,12 +3,17 @@ pragma solidity ^0.8.30;
 
 import { IOption } from "./IOption.sol";
 
-/// @notice Errors and events of the PositionRouter demo.
+/// @notice Types, errors and events of the PositionRouter demo.
 interface IPositionRouter {
+    struct Order {
+        IOption option;
+        uint40 deadline;
+        uint256 amount;
+        uint256 minPremium;
+    }
+
     /// @notice `option` was not created by the router's factory.
     error UnknownOption();
-    /// @notice `options` and `amounts` differ in length.
-    error LengthMismatch();
     /// @notice The order's market breaks the order rules.
     error MarketNotAllowed();
     /// @notice Zero amount or premium, or the nonce already holds an open order.
