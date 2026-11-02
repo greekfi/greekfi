@@ -181,27 +181,37 @@ contract PositionRouterTest is Test {
     }
 
     function testFork_CreateOrder_RejectsDisallowedMarkets() public {
+        (IOption longDated,) = _newOption(3_000e18, true, 31 days, 1 hours);
+        (IOption longWindow,) = _newOption(3_000e18, true, 1 days, 2 hours);
         IOption impostor = IOption(address(new FakeOption(address(rct))));
 
         vm.startPrank(alice);
         vm.expectRevert(IPositionRouter.MarketNotAllowed.selector);
         router.createOrder(1, opt, 1 ether, 100e6, 10 minutes); // American
+        vm.expectRevert(IPositionRouter.MarketNotAllowed.selector);
+        router.createOrder(1, longDated, 1 ether, 100e6, 10 minutes);
+        vm.expectRevert(IPositionRouter.MarketNotAllowed.selector);
+        router.createOrder(1, longWindow, 1 ether, 100e6, 10 minutes);
         vm.expectRevert(IPositionRouter.UnknownOption.selector);
         router.createOrder(1, impostor, 1 ether, 100e6, 10 minutes);
         vm.stopPrank();
     }
 
     function _newOption(uint256 strike, bool isEuro) internal returns (IOption option, IReceipt receipt) {
+        return _newOption(strike, isEuro, 1 days, 1 hours);
+    }
+
+    function _newOption(uint256 strike, bool isEuro, uint256 tenor, uint40 window) internal returns (IOption option, IReceipt receipt) {
         option = IOption(
             FACTORY.createOption(
                 CreateParams({
                     collateral: address(WETH),
                     consideration: address(USDC),
-                    expirationDate: uint40(block.timestamp + 1 days),
+                    expirationDate: uint40(block.timestamp + tenor),
                     strike: strike,
                     isPut: false,
                     isEuro: isEuro,
-                    windowSeconds: 1 hours
+                    windowSeconds: window
                 })
             )
         );

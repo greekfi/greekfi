@@ -37,6 +37,10 @@ contract PositionRouter is IPositionRouter {
     /// @notice The two tokens an order's market may pair, and the premium token is {USDC}.
     address public immutable WETH;
     address public immutable USDC;
+    /// @notice Longest time to expiration an order's market may have.
+    uint256 public constant MAX_TENOR = 30 days;
+    /// @notice Longest post-expiry exercise window an order's market may have.
+    uint256 public constant MAX_WINDOW = 1 hours;
 
     /// @notice Open limit orders by account and account-chosen nonce.
     mapping(address account => mapping(uint256 nonce => Order)) public orders;
@@ -71,8 +75,8 @@ contract PositionRouter is IPositionRouter {
     }
 
     /// @notice Offer to write and sell `amount` of `option` for at least `minPremium` USDC in total,
-    ///         until `duration` seconds from now. The market must be European and pair {WETH} with
-    ///         {USDC}.
+    ///         until `duration` seconds from now. The market must be European, pair {WETH} with {USDC},
+    ///         and fit {MAX_TENOR} and {MAX_WINDOW}.
     /// @param duration Lifetime of the order, for the Roles Modifier to cap.
     function createOrder(uint256 nonce, IOption option, uint256 amount, uint256 minPremium, uint32 duration) external {
         if (amount == 0 || minPremium == 0 || orders[msg.sender][nonce].amount != 0) revert InvalidOrder();
@@ -80,7 +84,11 @@ contract PositionRouter is IPositionRouter {
         IReceipt receipt = _receiptOf(option);
         address coll = address(receipt.collateral());
         address cons = address(receipt.consideration());
-        if (!receipt.isEuro() || !((coll == WETH && cons == USDC) || (coll == USDC && cons == WETH))) revert MarketNotAllowed();
+        if (
+            !receipt.isEuro() || receipt.expirationDate() > block.timestamp + MAX_TENOR
+                || receipt.exerciseDeadline() - receipt.expirationDate() > MAX_WINDOW
+                || !((coll == WETH && cons == USDC) || (coll == USDC && cons == WETH))
+        ) revert MarketNotAllowed();
 
         uint40 deadline = uint40(block.timestamp + duration);
         orders[msg.sender][nonce] = Order(option, deadline, amount, minPremium);
