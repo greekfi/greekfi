@@ -23,28 +23,15 @@ interface IBebopSettlement {
         uint256 flags;
     }
 
-    struct OldSingleQuote {
-        bool useOldAmount;
-        uint256 makerAmount;
-        uint256 makerNonce;
-    }
-
-    /// @notice EIP-712 hash of `order` without `flags`. With non-zero `updatedMakerAmount` /
-    ///         `updatedMakerNonce` those replace the order's own fields; this is the hash a taker
-    ///         signs for {settleSingle}.
+    /// @notice EIP-712 hash of `order` without `flags`. With zero `updatedMakerAmount` /
+    ///         `updatedMakerNonce` this is the hash a maker signs.
     function hashSingleOrder(SingleOrder calldata order, uint64 partnerId, uint256 updatedMakerAmount, uint256 updatedMakerNonce)
         external
         view
         returns (bytes32);
 
-    /// @notice Maker-executed single order. When `msg.sender` is not the taker, `takerSignature` must
-    ///         validate against `hashSingleOrder(order, partnerId, takerQuoteInfo.makerAmount,
-    ///         takerQuoteInfo.makerNonce)`.
-    function settleSingle(
-        SingleOrder calldata order,
-        MakerSignature calldata makerSignature,
-        uint256 filledTakerAmount,
-        OldSingleQuote calldata takerQuoteInfo,
-        bytes calldata takerSignature
-    ) external payable;
+    /// @notice Taker-executed single order: `msg.sender` must be `order.taker_address`. Pulls
+    ///         `filledTakerAmount` of the taker token (0 means all of `taker_amount`) and pays the
+    ///         maker amount, pro rata, to `order.receiver`.
+    function swapSingle(SingleOrder calldata order, MakerSignature calldata makerSignature, uint256 filledTakerAmount) external payable;
 }

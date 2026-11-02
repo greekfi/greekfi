@@ -1,67 +1,76 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.30;
 
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
 import { IFactory } from "../interfaces/IFactory.sol";
 import { IOption } from "../interfaces/IOption.sol";
 import { IReceipt } from "../interfaces/IReceipt.sol";
 import { IBebopSettlement } from "../interfaces/IBebopSettlement.sol";
-import { ISafe } from "../interfaces/ISafe.sol";
 
 /**
- * @title  PositionRouter: one fixed address for a writer's mint, burn, redeem and Bebop order signing
+ * @title  PositionRouter: one fixed address for a writer's mint, burn, transfer, redeem and Bebop limit orders
  * @notice DEMO ONLY. Not audited, not deployed, outside the audit scope in `auditors-instructions.md`.
  *
  *         Every market is its own Option/Receipt clone pair, so an account whose call permissions are
  *         scoped by target address (a Safe behind a Zodiac Roles Modifier, say) would need a new
  *         permission for every series it writes. This router gives that account one fixed target.
  *
- *         Called normally, {mint}, {burn} and {redeem} take a list of markets, validate that each
- *         belongs to {FACTORY}, then forward to its operator entry points with `msg.sender` as the
- *         account. Setup:
- *         approve collateral to the factory, then `factory.setPermissions(router, MINT | BURN | REDEEM)`.
- *         Each of those bits pays out only to the account, and the router only ever names
- *         `msg.sender`, so nobody can use it to act on anyone else's position.
+ *         {mint}, {burn}, {transfer} and {redeem} take a list of markets, validate that each belongs to
+ *         {FACTORY}, then act on `msg.sender`'s own position only.
  *
- *         Called by DELEGATECALL from a Safe 1.3.0, {signOrder} pre-signs one Bebop order that sells
- *         a Greek option for USDC, so a maker can execute it with `BebopSettlement.settleSingle`
- *         until `order.expiry` without the Safe signing again (same pattern as Gnosis Guild's
- *         CowswapOrderSigner). Bebop verifies the taker by calling `Safe.isValidSignature(hash, "")`,
- *         which the Safe's CompatibilityFallbackHandler answers from `signedMessages`. Selling mints
- *         just in time: Bebop's `transferFrom(Safe, maker)` runs the auto-mint, so the Safe also
- *         grants `factory.setPermissions(BEBOP, TRANSFER | MINT)`.
+ *         {createOrder} stores a limit order to sell freshly written options for at least a minimum
+ *         USDC premium. Anyone may then {submitOrder} a Bebop quote that fits it: the router mints the
+ *         options from the account, sells them to the maker with itself as taker, and the premium goes
+ *         straight to the account. The router holds the options only inside that call.
+ *
+ *         Setup: approve collateral to the factory (the approval caps what all orders can write), then
+ *         `factory.setPermissions(router, TRANSFER | MINT | BURN | REDEEM)`. With MINT, {transfer}
+ *         writes and sends options to any `to`, so a Roles preset must pin `to`.
  */
 contract PositionRouter {
-    /// @dev keccak256("SafeMessage(bytes message)")
-    bytes32 private constant SAFE_MSG_TYPEHASH = 0x60b3cbf8b4a223d68d641b3b6ddf9a298e7f33710cf3d3a9d1146b5a6150fbca;
-    /// @dev Slot of `mapping(bytes32 => uint256) signedMessages` in Safe 1.3.0 (`GnosisSafeStorage`).
-    uint256 private constant SIGNED_MESSAGES_SLOT = 7;
+    struct Order {
+        IOption option;
+        uint40 deadline;
+        uint256 amount;
+        uint256 minPremium;
+    }
 
     /// @notice The factory whose markets this router accepts.
     IFactory public immutable FACTORY;
-    /// @notice Bebop settlement contract whose order hash {signOrder} signs.
+    /// @notice Bebop settlement contract that {submitOrder} settles on.
     IBebopSettlement public immutable BEBOP;
-    /// @notice The two tokens a signed market may pair, and the premium token is {USDC}.
+    /// @notice The two tokens an order's market may pair, and the premium token is {USDC}.
     address public immutable WETH;
     address public immutable USDC;
-    /// @notice Longest time to expiration a signed market may have.
+    /// @notice Longest time to expiration an order's market may have.
     uint256 public immutable MAX_TENOR;
-    /// @notice Longest post-expiry exercise window a signed market may have.
+    /// @notice Longest post-expiry exercise window an order's market may have.
     uint256 public immutable MAX_WINDOW;
-    address private immutable SELF;
+
+    /// @notice Open limit orders by account and account-chosen nonce.
+    mapping(address account => mapping(uint256 nonce => Order)) public orders;
 
     /// @notice `option` was not created by {FACTORY}.
     error UnknownOption();
     /// @notice `options` and `amounts` differ in length.
     error LengthMismatch();
-    /// @notice {signOrder} / {unsignOrder} were called directly instead of by DELEGATECALL.
-    error DelegateCallOnly();
-    /// @notice The order's fields break the signing rules.
-    error InvalidOrder();
-    /// @notice The order's market breaks the signing rules.
+    /// @notice The order's market breaks the order rules.
     error MarketNotAllowed();
+    /// @notice Zero amount or premium, or the nonce already holds an open order.
+    error InvalidOrder();
+    /// @notice No open order at this account and nonce.
+    error UnknownOrder();
+    /// @notice The order's deadline has passed.
+    error OrderExpired();
+    /// @notice The quote does not sell exactly this order to the router for USDC paid to the account.
+    error QuoteMismatch();
+    /// @notice The account received less USDC than the order's minimum premium.
+    error PremiumTooLow();
 
-    /// @dev Emitted from the Safe, as Safe's SignMessageLib does, so Safe tooling sees the signature.
-    event SignMsg(bytes32 indexed msgHash);
+    event OrderCreated(address indexed account, uint256 indexed nonce, IOption option, uint256 amount, uint256 minPremium, uint40 deadline);
+    event OrderCancelled(address indexed account, uint256 indexed nonce);
+    event OrderFilled(address indexed account, uint256 indexed nonce, address indexed maker, uint256 premium);
 
     constructor(IFactory factory_, IBebopSettlement bebop_, address weth_, address usdc_, uint256 maxTenor_, uint256 maxWindow_) {
         FACTORY = factory_;
@@ -70,7 +79,6 @@ contract PositionRouter {
         USDC = usdc_;
         MAX_TENOR = maxTenor_;
         MAX_WINDOW = maxWindow_;
-        SELF = address(this);
     }
 
     /// @notice For each `i`, mint `amounts[i]` of `options[i]` for the caller, paid from the caller's
@@ -94,6 +102,17 @@ contract PositionRouter {
         }
     }
 
+    /// @notice For each `i`, send `amounts[i]` of the caller's `options[i]` to `to`. Needs
+    ///         `Perm.TRANSFER`; with `Perm.MINT` too, any shortfall is minted from the caller's
+    ///         collateral allowance and the caller keeps the Receipts.
+    function transfer(IOption[] calldata options, address to, uint256[] calldata amounts) external {
+        if (options.length != amounts.length) revert LengthMismatch();
+        for (uint256 i; i < options.length; ++i) {
+            _receiptOf(options[i]);
+            options[i].transferFrom(msg.sender, to, amounts[i]);
+        }
+    }
+
     /// @notice Redeem the caller's full Receipt balance in each of `options`' markets; proceeds go
     ///         to the caller. Needs `Perm.REDEEM`. Without the grant {IReceipt.redeemFor} skips the
     ///         caller silently and this call succeeds having done nothing. Any market whose
@@ -106,24 +125,14 @@ contract PositionRouter {
         }
     }
 
-    /// @notice DELEGATECALL only. Mark `order` as signed by the calling Safe, at a premium of at least
-    ///         `minMakerAmount` USDC. The maker settles it with `settleSingle(order, makerSig, 0,
-    ///         OldSingleQuote(false, minMakerAmount, order.maker_nonce), "")` and `order.flags`
-    ///         signature type 1 (EIP-1271). The maker may raise `maker_amount`; any other change
-    ///         breaks the hash. The submitter picks the fill size (`filledTakerAmount` is in neither
-    ///         signature): anything up to `order.taker_amount`, with the premium scaled pro-rata and
-    ///         rounded down, so a dust fill can pay zero. The first fill of any size spends the maker
-    ///         nonce, so the signature fills once. To survive partial fills, sign several orders on
-    ///         fresh nonces and set the Safe's collateral approval to the factory to the intended
-    ///         size: the approval, not the orders, then caps how much can mint.
-    /// @param validDuration Upper bound on `order.expiry - now`, for the Roles Modifier to cap.
-    function signOrder(IBebopSettlement.SingleOrder calldata order, uint256 minMakerAmount, uint32 validDuration) external {
-        if (
-            order.expiry > block.timestamp + validDuration || order.taker_address != address(this) || order.receiver != address(this)
-                || order.maker_token != USDC || order.packed_commands != 0 || minMakerAmount == 0
-        ) revert InvalidOrder();
+    /// @notice Offer to write and sell `amount` of `option` for at least `minPremium` USDC in total,
+    ///         until `duration` seconds from now. The market must be European, pair {WETH} with {USDC},
+    ///         and fit {MAX_TENOR} and {MAX_WINDOW}.
+    /// @param duration Lifetime of the order, for the Roles Modifier to cap.
+    function createOrder(uint256 nonce, IOption option, uint256 amount, uint256 minPremium, uint32 duration) external {
+        if (amount == 0 || minPremium == 0 || orders[msg.sender][nonce].amount != 0) revert InvalidOrder();
 
-        IReceipt receipt = _receiptOf(IOption(order.taker_token));
+        IReceipt receipt = _receiptOf(option);
         address coll = address(receipt.collateral());
         address cons = address(receipt.consideration());
         if (
@@ -132,34 +141,45 @@ contract PositionRouter {
                 || !((coll == WETH && cons == USDC) || (coll == USDC && cons == WETH))
         ) revert MarketNotAllowed();
 
-        _setSigned(order, minMakerAmount, 1);
+        uint40 deadline = uint40(block.timestamp + duration);
+        orders[msg.sender][nonce] = Order(option, deadline, amount, minPremium);
+        emit OrderCreated(msg.sender, nonce, option, amount, minPremium, deadline);
     }
 
-    /// @notice DELEGATECALL only. Withdraw a {signOrder} signature before a maker settles it.
-    function unsignOrder(IBebopSettlement.SingleOrder calldata order, uint256 minMakerAmount) external {
-        _setSigned(order, minMakerAmount, 0);
+    /// @notice Withdraw the caller's open order at `nonce`.
+    function cancelOrder(uint256 nonce) external {
+        if (orders[msg.sender][nonce].amount == 0) revert UnknownOrder();
+        delete orders[msg.sender][nonce];
+        emit OrderCancelled(msg.sender, nonce);
     }
 
-    /// @dev Writes `signedMessages[msgHash]` in the Safe's storage, where `msgHash` is what the Safe's
-    ///      CompatibilityFallbackHandler derives from Bebop's taker hash. partnerId 0 keeps any partner
-    ///      fee out of the premium.
-    function _setSigned(IBebopSettlement.SingleOrder calldata order, uint256 minMakerAmount, uint256 value) private {
-        if (address(this) == SELF) revert DelegateCallOnly();
+    /// @notice Fill `account`'s order at `nonce` with a Bebop quote, all or nothing. Callable by
+    ///         anyone. The quote must name this router as taker and `account` as receiver, sell
+    ///         exactly the order's option and amount for USDC, and pay `account` at least the order's
+    ///         minimum premium after any fee.
+    function submitOrder(
+        address account,
+        uint256 nonce,
+        IBebopSettlement.SingleOrder calldata quote,
+        IBebopSettlement.MakerSignature calldata makerSignature
+    ) external {
+        Order memory order = orders[account][nonce];
+        if (order.amount == 0) revert UnknownOrder();
+        if (block.timestamp > order.deadline) revert OrderExpired();
+        if (
+            quote.taker_address != address(this) || quote.receiver != account || quote.taker_token != address(order.option)
+                || quote.taker_amount != order.amount || quote.maker_token != USDC || quote.packed_commands != 0
+        ) revert QuoteMismatch();
+        delete orders[account][nonce];
 
-        bytes32 orderHash = BEBOP.hashSingleOrder(order, 0, minMakerAmount, order.maker_nonce);
-        bytes32 msgHash = keccak256(
-            abi.encodePacked(
-                bytes1(0x19),
-                bytes1(0x01),
-                ISafe(address(this)).domainSeparator(),
-                keccak256(abi.encode(SAFE_MSG_TYPEHASH, keccak256(abi.encode(orderHash))))
-            )
-        );
-        bytes32 slot = keccak256(abi.encode(msgHash, SIGNED_MESSAGES_SLOT));
-        assembly ("memory-safe") {
-            sstore(slot, value)
-        }
-        emit SignMsg(msgHash);
+        uint256 usdcBefore = IERC20(USDC).balanceOf(account);
+        order.option.transferFrom(account, address(this), order.amount);
+        order.option.approve(address(BEBOP), order.amount);
+        BEBOP.swapSingle(quote, makerSignature, 0);
+
+        uint256 premium = IERC20(USDC).balanceOf(account) - usdcBefore;
+        if (premium < order.minPremium) revert PremiumTooLow();
+        emit OrderFilled(account, nonce, quote.maker_address, premium);
     }
 
     /// @dev The factory registers every Receipt it creates, and each Receipt names its Option, so a

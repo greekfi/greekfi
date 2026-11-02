@@ -30,7 +30,7 @@ contracts/
 │   ├── IBebopSettlement.sol  # Slice of Bebop's settlement contract used by the router
 │   └── ISafe.sol             # Slice of Safe 1.3.0 used by the router
 └── periphery/
-    └── PositionRouter.sol    # DEMO: fixed-target mint / burn / redeem and Bebop order pre-signing for a Safe
+    └── PositionRouter.sol    # DEMO: fixed-target mint / burn / transfer / redeem and Bebop limit orders for a Safe
 test/                         # Mainnet-fork tests against the deployed v1.3 factory, Bebop and the ENS Endowment Safe
 ```
 

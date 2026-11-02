@@ -19,7 +19,7 @@ contract FakeOption {
     }
 }
 
-/// @notice The router's mint / burn / redeem against the deployed v1.3 factory on a mainnet fork.
+/// @notice The router's mint / burn / transfer / redeem and order book against the deployed v1.3 factory on a mainnet fork.
 contract PositionRouterTest is Test {
     IFactory constant FACTORY = IFactory(0x9999999999906A9a5B3CFB1151Ac6812B3042191); // v1.3
     address constant BEBOP = 0xbbbbbBB520d69a9775E85b458C58c648259FAD5F;
@@ -27,6 +27,7 @@ contract PositionRouterTest is Test {
     IERC20 constant USDC = IERC20(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48);
 
     // `Perm` bits from the v1.3 factory (greekfi/contracts c7200d4, contracts/Permissions.sol).
+    uint256 constant TRANSFER = 1 << 0;
     uint256 constant MINT = 1 << 1;
     uint256 constant BURN = 1 << 2;
     uint256 constant REDEEM = 1 << 3;
@@ -187,38 +188,76 @@ contract PositionRouterTest is Test {
         assertEq(opt.balanceOf(alice), 0, "first leg rolled back");
     }
 
-    /// @notice Signing writes the caller's storage, so a plain call must not reach it. The order is
-    ///         otherwise valid (European, WETH/USDC, router as taker and receiver), so the only
-    ///         reason left to revert is the call type.
-    function testFork_SignOrder_RevertsWithoutDelegateCall() public {
-        (IOption euro,) = _newOption(3_000e18, true);
-        IBebopSettlement.SingleOrder memory order = IBebopSettlement.SingleOrder({
-            expiry: block.timestamp + 10 minutes,
-            taker_address: address(router),
-            maker_address: bob,
-            maker_nonce: 1,
-            taker_token: address(euro),
-            maker_token: address(USDC),
-            taker_amount: 1 ether,
-            maker_amount: 100e6,
-            receiver: address(router),
-            packed_commands: 0,
-            flags: 1
-        });
+    function testFork_Transfer_MintsShortfallAndKeepsReceipts() public {
+        _grant(alice, TRANSFER | MINT);
+        _mint(opt, alice, 4 ether);
 
-        vm.expectRevert(PositionRouter.DelegateCallOnly.selector);
-        router.signOrder(order, 100e6, 10 minutes);
-        vm.expectRevert(PositionRouter.DelegateCallOnly.selector);
-        router.unsignOrder(order, 100e6);
+        vm.prank(alice);
+        router.transfer(_opts(opt), bob, _amts(10 ether));
+
+        assertEq(opt.balanceOf(bob), 10 ether, "bob holds the options");
+        assertEq(opt.balanceOf(alice), 0, "alice sent her own first");
+        assertEq(rct.balanceOf(alice), 10 ether, "alice keeps every receipt");
+    }
+
+    function testFork_Transfer_MovesOnlyCallerOptions() public {
+        _grant(alice, TRANSFER | MINT);
+        _mint(opt, alice, 10 ether);
+
+        vm.prank(mallory);
+        vm.expectRevert();
+        router.transfer(_opts(opt), mallory, _amts(1 ether));
+
+        assertEq(opt.balanceOf(alice), 10 ether, "alice untouched");
+    }
+
+    function testFork_CreateOrder_StoresAndCancels() public {
+        (IOption euro,) = _newOption(3_000e18, true);
+
+        vm.startPrank(alice);
+        router.createOrder(7, euro, 1 ether, 100e6, 10 minutes);
+        (IOption stored, uint40 deadline, uint256 amount, uint256 minPremium) = router.orders(alice, 7);
+        assertEq(address(stored), address(euro), "option");
+        assertEq(deadline, block.timestamp + 10 minutes, "deadline");
+        assertEq(amount, 1 ether, "amount");
+        assertEq(minPremium, 100e6, "min premium");
+
+        vm.expectRevert(PositionRouter.InvalidOrder.selector);
+        router.createOrder(7, euro, 1 ether, 100e6, 10 minutes);
+
+        router.cancelOrder(7);
+        (,, amount,) = router.orders(alice, 7);
+        assertEq(amount, 0, "cancelled");
+        vm.expectRevert(PositionRouter.UnknownOrder.selector);
+        router.cancelOrder(7);
+        vm.stopPrank();
+    }
+
+    function testFork_CreateOrder_RejectsDisallowedMarkets() public {
+        (IOption longDated,) = _newOption(3_000e18, true, 60 days);
+        IOption impostor = IOption(address(new FakeOption(address(rct))));
+
+        vm.startPrank(alice);
+        vm.expectRevert(PositionRouter.MarketNotAllowed.selector);
+        router.createOrder(1, opt, 1 ether, 100e6, 10 minutes); // American
+        vm.expectRevert(PositionRouter.MarketNotAllowed.selector);
+        router.createOrder(1, longDated, 1 ether, 100e6, 10 minutes);
+        vm.expectRevert(PositionRouter.UnknownOption.selector);
+        router.createOrder(1, impostor, 1 ether, 100e6, 10 minutes);
+        vm.stopPrank();
     }
 
     function _newOption(uint256 strike, bool isEuro) internal returns (IOption option, IReceipt receipt) {
+        return _newOption(strike, isEuro, 1 days);
+    }
+
+    function _newOption(uint256 strike, bool isEuro, uint256 tenor) internal returns (IOption option, IReceipt receipt) {
         option = IOption(
             FACTORY.createOption(
                 CreateParams({
                     collateral: address(WETH),
                     consideration: address(USDC),
-                    expirationDate: uint40(block.timestamp + 1 days),
+                    expirationDate: uint40(block.timestamp + tenor),
                     strike: strike,
                     isPut: false,
                     isEuro: isEuro,
