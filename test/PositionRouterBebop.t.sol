@@ -27,6 +27,7 @@ contract PositionRouterBebopTest is Test {
     // `Perm` bits from the v1.3 factory (greekfi/contracts c7200d4, contracts/Permissions.sol).
     uint256 constant TRANSFER = 1 << 0;
     uint256 constant MINT = 1 << 1;
+    uint256 constant BURN = 1 << 2;
     uint256 constant REDEEM = 1 << 3;
 
     uint256 constant MAKER_KEY = 0xBEB0;
@@ -84,7 +85,7 @@ contract PositionRouterBebopTest is Test {
         assertEq(USDC.balanceOf(SAFE) - usdcBefore, PREMIUM, "premium to safe");
         assertEq(wethBefore - WETH.balanceOf(SAFE), AMOUNT, "collateral locked");
         assertEq(option.balanceOf(address(router)), 0, "router holds nothing");
-        (,, uint256 open,) = router.orders(SAFE, NONCE);
+        (,,, uint256 open,) = router.orders(SAFE, NONCE);
         assertEq(open, 0, "order spent");
 
         vm.warp(option.receipt().exerciseDeadline() + 1);
@@ -167,8 +168,91 @@ contract PositionRouterBebopTest is Test {
         assertEq(WETH.allowance(SAFE, address(FACTORY)), 0, "approval spent");
     }
 
+    function testFork_BuyBackBurnsAndReturnsCollateral() public {
+        _sellThenReadyBuyBack(true);
+        uint256 wethBefore = WETH.balanceOf(SAFE);
+        uint256 usdcBefore = USDC.balanceOf(SAFE);
+
+        _createBuyOrder(2, PREMIUM);
+        _submit(2, _buyQuote(PREMIUM - 100e6));
+
+        assertEq(usdcBefore - USDC.balanceOf(SAFE), PREMIUM - 100e6, "paid the quote, not the cap");
+        assertEq(option.receipt().balanceOf(SAFE), 0, "receipts burned");
+        assertEq(option.balanceOf(SAFE), 0, "options burned");
+        assertEq(WETH.balanceOf(SAFE) - wethBefore, AMOUNT, "collateral back");
+        assertEq(option.balanceOf(address(router)) + USDC.balanceOf(address(router)), 0, "router holds nothing");
+    }
+
+    /// @notice Without the BURN grant the options land in the Safe next to its Receipts.
+    function testFork_BuyBackWithoutBurnGrantHoldsOptions() public {
+        _sellThenReadyBuyBack(false);
+
+        _createBuyOrder(2, PREMIUM);
+        _submit(2, _buyQuote(PREMIUM));
+
+        assertEq(option.balanceOf(SAFE), AMOUNT, "options returned");
+        assertEq(option.receipt().balanceOf(SAFE), AMOUNT, "receipts kept");
+    }
+
+    function testFork_BuyAboveLimitReverts() public {
+        _sellThenReadyBuyBack(true);
+        _createBuyOrder(2, PREMIUM);
+
+        _submitExpectingRevert(2, _buyQuote(PREMIUM + 1), abi.encodeWithSelector(IPositionRouter.PremiumTooHigh.selector));
+    }
+
+    /// @notice A buy quote must deliver exactly the order's amount to the router, not to the Safe.
+    function testFork_MismatchedBuyQuotesRevert() public {
+        _sellThenReadyBuyBack(true);
+        _createBuyOrder(2, PREMIUM);
+        bytes memory mismatch = abi.encodeWithSelector(IPositionRouter.QuoteMismatch.selector);
+
+        IBebopSettlement.SingleOrder memory quote = _buyQuote(PREMIUM);
+        quote.receiver = SAFE;
+        _submitExpectingRevert(2, quote, mismatch);
+
+        quote = _buyQuote(PREMIUM);
+        quote.maker_amount = AMOUNT / 2;
+        _submitExpectingRevert(2, quote, mismatch);
+    }
+
     function _createOrder(uint256 nonce, uint256 minPremium, uint32 duration) internal {
-        assertTrue(_fromRoles(abi.encodeCall(router.createOrder, (nonce, option, AMOUNT, minPremium, duration))), "create");
+        assertTrue(_fromRoles(abi.encodeCall(router.createOrder, (nonce, option, false, AMOUNT, minPremium, duration))), "create");
+    }
+
+    function _createBuyOrder(uint256 nonce, uint256 maxPremium) internal {
+        assertTrue(_fromRoles(abi.encodeCall(router.createOrder, (nonce, option, true, AMOUNT, maxPremium, 1 days))), "create buy");
+    }
+
+    /// @dev The maker sells the options back: it pays them, the router pays USDC.
+    function _buyQuote(uint256 takerAmount) internal view returns (IBebopSettlement.SingleOrder memory) {
+        return IBebopSettlement.SingleOrder({
+            expiry: block.timestamp + 1 minutes,
+            taker_address: address(router),
+            maker_address: maker,
+            maker_nonce: 2,
+            taker_token: address(USDC),
+            maker_token: address(option),
+            taker_amount: takerAmount,
+            maker_amount: AMOUNT,
+            receiver: address(router),
+            packed_commands: 0,
+            flags: 0
+        });
+    }
+
+    /// @dev Writes and sells AMOUNT, then readies the Safe and the maker for a buy-back.
+    function _sellThenReadyBuyBack(bool grantBurn) internal {
+        _createOrder(NONCE, PREMIUM, 1 days);
+        _submit(NONCE, _quote(PREMIUM));
+
+        deal(address(USDC), SAFE, USDC.balanceOf(SAFE) + PREMIUM);
+        vm.startPrank(SAFE);
+        USDC.approve(address(router), PREMIUM);
+        if (grantBurn) FACTORY.setPermissions(address(router), TRANSFER | MINT | BURN | REDEEM);
+        vm.stopPrank();
+        vm.prank(maker);
+        option.approve(BEBOP, AMOUNT);
     }
 
     /// @dev What the Roles Modifier does for kpk: have the Safe CALL the router.

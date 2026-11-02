@@ -164,18 +164,19 @@ contract PositionRouterTest is Test {
         (IOption euro,) = _newOption(3_000e18, true);
 
         vm.startPrank(alice);
-        router.createOrder(7, euro, 1 ether, 100e6, 10 minutes);
-        (IOption stored, uint40 deadline, uint256 amount, uint256 minPremium) = router.orders(alice, 7);
+        router.createOrder(7, euro, false, 1 ether, 100e6, 10 minutes);
+        (IOption stored, uint40 deadline, bool isBuy, uint256 amount, uint256 premium) = router.orders(alice, 7);
         assertEq(address(stored), address(euro), "option");
         assertEq(deadline, block.timestamp + 10 minutes, "deadline");
         assertEq(amount, 1 ether, "amount");
-        assertEq(minPremium, 100e6, "min premium");
+        assertFalse(isBuy, "sell");
+        assertEq(premium, 100e6, "premium");
 
         vm.expectRevert(IPositionRouter.InvalidOrder.selector);
-        router.createOrder(7, euro, 1 ether, 100e6, 10 minutes);
+        router.createOrder(7, euro, false, 1 ether, 100e6, 10 minutes);
 
         router.cancelOrder(7);
-        (,, amount,) = router.orders(alice, 7);
+        (,,, amount,) = router.orders(alice, 7);
         assertEq(amount, 0, "cancelled");
         vm.stopPrank();
     }
@@ -187,13 +188,13 @@ contract PositionRouterTest is Test {
 
         vm.startPrank(alice);
         vm.expectRevert(IPositionRouter.MarketNotAllowed.selector);
-        router.createOrder(1, opt, 1 ether, 100e6, 10 minutes); // American
+        router.createOrder(1, opt, false, 1 ether, 100e6, 10 minutes); // American
         vm.expectRevert(IPositionRouter.MarketNotAllowed.selector);
-        router.createOrder(1, longDated, 1 ether, 100e6, 10 minutes);
+        router.createOrder(1, longDated, false, 1 ether, 100e6, 10 minutes);
         vm.expectRevert(IPositionRouter.MarketNotAllowed.selector);
-        router.createOrder(1, longWindow, 1 ether, 100e6, 10 minutes);
+        router.createOrder(1, longWindow, false, 1 ether, 100e6, 10 minutes);
         vm.expectRevert(IPositionRouter.UnknownOption.selector);
-        router.createOrder(1, impostor, 1 ether, 100e6, 10 minutes);
+        router.createOrder(1, impostor, false, 1 ether, 100e6, 10 minutes);
         vm.stopPrank();
     }
 

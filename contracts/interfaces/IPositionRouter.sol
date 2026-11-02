@@ -5,11 +5,14 @@ import { IOption } from "./IOption.sol";
 
 /// @notice Types, errors and events of the PositionRouter demo.
 interface IPositionRouter {
+    /// @param isBuy   Buy `amount` options back instead of writing and selling them.
+    /// @param premium Total USDC: the least a sell receives, or the most a buy pays.
     struct Order {
         IOption option;
         uint40 deadline;
+        bool isBuy;
         uint256 amount;
-        uint256 minPremium;
+        uint256 premium;
     }
 
     /// @notice `option` was not created by the router's factory.
@@ -22,12 +25,16 @@ interface IPositionRouter {
     error UnknownOrder();
     /// @notice The order's deadline has passed.
     error OrderExpired();
-    /// @notice The quote does not sell exactly this order to the router for USDC paid to the account.
+    /// @notice The quote does not trade exactly this order's option and amount for USDC with the router.
     error QuoteMismatch();
-    /// @notice The account received less USDC than the order's minimum premium.
+    /// @notice A sell paid the account less USDC than the order's premium.
     error PremiumTooLow();
+    /// @notice A buy would pay more USDC than the order's premium.
+    error PremiumTooHigh();
 
-    event OrderCreated(address indexed account, uint256 indexed nonce, IOption option, uint256 amount, uint256 minPremium, uint40 deadline);
+    event OrderCreated(
+        address indexed account, uint256 indexed nonce, IOption option, bool isBuy, uint256 amount, uint256 premium, uint40 deadline
+    );
     event OrderCancelled(address indexed account, uint256 indexed nonce);
     event OrderFilled(address indexed account, uint256 indexed nonce, address indexed maker, uint256 premium);
 }

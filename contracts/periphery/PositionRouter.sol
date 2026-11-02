@@ -2,6 +2,7 @@
 pragma solidity ^0.8.30;
 
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import { IFactory } from "../interfaces/IFactory.sol";
 import { IOption } from "../interfaces/IOption.sol";
@@ -21,15 +22,21 @@ import { IPositionRouter } from "../interfaces/IPositionRouter.sol";
  *         {FACTORY}, then act on `msg.sender`'s own position only.
  *
  *         {createOrder} stores a limit order to sell freshly written options for at least a minimum
- *         USDC premium. Anyone may then {submitOrder} a Bebop quote that fits it: the router mints the
- *         options from the account, sells them to the maker with itself as taker, and the premium goes
- *         straight to the account. The router holds the options only inside that call.
+ *         USDC premium, or to buy options back for at most a maximum. Anyone may then {submitOrder} a
+ *         Bebop quote that fits it, with the router as taker. A sell mints the options from the
+ *         account and the premium goes straight to the account. A buy pulls the USDC from the account
+ *         and sends the options on to it, pair-burning them against its Receipts. The router holds
+ *         tokens only inside that call.
  *
- *         Setup: approve collateral to the factory (the approval caps what all orders can write), then
- *         `factory.setPermissions(router, TRANSFER | MINT | REDEEM)`. With MINT, {transfer}
- *         writes and sends options to any `to`, so a Roles preset must pin `to`.
+ *         Setup: approve collateral to the factory (the approval caps what all orders can write) and
+ *         USDC to the router (it caps what buys can spend), then
+ *         `factory.setPermissions(router, TRANSFER | MINT | BURN | REDEEM)`. With MINT, {transfer}
+ *         writes and sends options to any `to`, so a Roles preset must pin `to`. With BURN, options
+ *         anyone sends to the account through the router net against its Receipts.
  */
 contract PositionRouter is IPositionRouter {
+    using SafeERC20 for IERC20;
+
     /// @notice The factory whose markets this router accepts.
     IFactory public immutable FACTORY;
     /// @notice Bebop settlement contract that {submitOrder} settles on.
@@ -74,12 +81,13 @@ contract PositionRouter is IPositionRouter {
         }
     }
 
-    /// @notice Offer to write and sell `amount` of `option` for at least `minPremium` USDC in total,
-    ///         until `duration` seconds from now. The market must be European, pair {WETH} with {USDC},
-    ///         and fit {MAX_TENOR} and {MAX_WINDOW}.
+    /// @notice Offer to write and sell `amount` of `option` for at least `premium` USDC in total, or
+    ///         with `isBuy` to buy `amount` back for at most `premium`, until `duration` seconds from
+    ///         now. The market must be European, pair {WETH} with {USDC}, and fit {MAX_TENOR} and
+    ///         {MAX_WINDOW}.
     /// @param duration Lifetime of the order, for the Roles Modifier to cap.
-    function createOrder(uint256 nonce, IOption option, uint256 amount, uint256 minPremium, uint32 duration) external {
-        if (amount == 0 || minPremium == 0 || orders[msg.sender][nonce].amount != 0) revert InvalidOrder();
+    function createOrder(uint256 nonce, IOption option, bool isBuy, uint256 amount, uint256 premium, uint32 duration) external {
+        if (amount == 0 || premium == 0 || orders[msg.sender][nonce].amount != 0) revert InvalidOrder();
 
         IReceipt receipt = _receiptOf(option);
         address coll = address(receipt.collateral());
@@ -91,8 +99,8 @@ contract PositionRouter is IPositionRouter {
         ) revert MarketNotAllowed();
 
         uint40 deadline = uint40(block.timestamp + duration);
-        orders[msg.sender][nonce] = Order(option, deadline, amount, minPremium);
-        emit OrderCreated(msg.sender, nonce, option, amount, minPremium, deadline);
+        orders[msg.sender][nonce] = Order(option, deadline, isBuy, amount, premium);
+        emit OrderCreated(msg.sender, nonce, option, isBuy, amount, premium, deadline);
     }
 
     /// @notice Withdraw the caller's open order at `nonce`.
@@ -102,9 +110,9 @@ contract PositionRouter is IPositionRouter {
     }
 
     /// @notice Fill `account`'s order at `nonce` with a Bebop quote, all or nothing. Callable by
-    ///         anyone. The quote must name this router as taker and `account` as receiver, sell
-    ///         exactly the order's option and amount for USDC, and pay `account` at least the order's
-    ///         minimum premium after any fee.
+    ///         anyone. The quote names this router as taker and trades exactly the order's option and
+    ///         amount for USDC. A sell pays `account` directly; a buy delivers to the router, which
+    ///         passes the options on to `account`.
     function submitOrder(
         address account,
         uint256 nonce,
@@ -114,20 +122,55 @@ contract PositionRouter is IPositionRouter {
         Order memory order = orders[account][nonce];
         if (order.amount == 0) revert UnknownOrder();
         if (block.timestamp > order.deadline) revert OrderExpired();
+        (address paid, address bought, uint256 size, address receiver) = order.isBuy
+            ? (USDC, address(order.option), quote.maker_amount, address(this))
+            : (address(order.option), USDC, quote.taker_amount, account);
         if (
-            quote.taker_address != address(this) || quote.receiver != account || quote.taker_token != address(order.option)
-                || quote.taker_amount != order.amount || quote.maker_token != USDC || quote.packed_commands != 0
+            quote.taker_address != address(this) || quote.taker_token != paid || quote.maker_token != bought || size != order.amount
+                || quote.receiver != receiver || quote.packed_commands != 0
         ) revert QuoteMismatch();
         delete orders[account][nonce];
 
+        uint256 premium = order.isBuy ? _buy(account, order, quote, makerSignature) : _sell(account, order, quote, makerSignature);
+        emit OrderFilled(account, nonce, quote.maker_address, premium);
+    }
+
+    /// @dev Mints the options from `account` into the router and sells them; the USDC goes straight
+    ///      to `account` and is measured there, so any fee counts against the premium.
+    function _sell(
+        address account,
+        Order memory order,
+        IBebopSettlement.SingleOrder calldata quote,
+        IBebopSettlement.MakerSignature calldata makerSignature
+    ) private returns (uint256 premium) {
         uint256 usdcBefore = IERC20(USDC).balanceOf(account);
         order.option.transferFrom(account, address(this), order.amount);
         order.option.approve(address(BEBOP), order.amount);
         BEBOP.swapSingle(quote, makerSignature, 0);
 
-        uint256 premium = IERC20(USDC).balanceOf(account) - usdcBefore;
-        if (premium < order.minPremium) revert PremiumTooLow();
-        emit OrderFilled(account, nonce, quote.maker_address, premium);
+        premium = IERC20(USDC).balanceOf(account) - usdcBefore;
+        if (premium < order.premium) revert PremiumTooLow();
+    }
+
+    /// @dev Pulls the quoted USDC from `account`, buys the options into the router and sends them on.
+    ///      With `Perm.BURN` from `account`, that send pair-burns them against its Receipts and the
+    ///      collateral returns to `account` in the same call.
+    function _buy(
+        address account,
+        Order memory order,
+        IBebopSettlement.SingleOrder calldata quote,
+        IBebopSettlement.MakerSignature calldata makerSignature
+    ) private returns (uint256 premium) {
+        premium = quote.taker_amount;
+        if (premium > order.premium) revert PremiumTooHigh();
+        IERC20(USDC).safeTransferFrom(account, address(this), premium);
+        IERC20(USDC).forceApprove(address(BEBOP), premium);
+
+        uint256 held = order.option.balanceOf(address(this));
+        BEBOP.swapSingle(quote, makerSignature, 0);
+        // A partner fee would come out of the options delivered.
+        if (order.option.balanceOf(address(this)) - held < order.amount) revert QuoteMismatch();
+        order.option.transfer(account, order.amount);
     }
 
     /// @dev The factory registers every Receipt it creates, and each Receipt names its Option, so a
