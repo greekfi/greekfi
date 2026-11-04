@@ -197,12 +197,11 @@ contract PositionRouterTest is Test {
         _sell(2, past35, _terms(past35), abi.encodeWithSelector(IPositionRouter.MarketNotAllowed.selector));
     }
 
-    /// @notice An order must end at least EXPIRY_BUFFER before its market expires, so an expired
-    ///         market can't be ordered at all.
+    /// @notice An order can't outlive its market, so an expired market can't be ordered at all.
     function testFork_CreateOrder_EndsBeforeExpiry() public {
         (IOption euro,) = _newOption(3_000e18, true); // expires in 1 day
         Terms memory t = _terms(euro);
-        uint32 latest = uint32(1 days - router.EXPIRY_BUFFER());
+        uint32 latest = uint32(1 days);
         bytes memory outlives = abi.encodeWithSelector(IPositionRouter.OrderOutlivesMarket.selector);
 
         _order(1, euro, t, false, 1 ether, 100e6, latest, "");
