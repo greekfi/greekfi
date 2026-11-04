@@ -163,8 +163,7 @@ contract PositionRouterTest is Test {
     function testFork_CreateOrder_StoresAndCancels() public {
         (IOption euro,) = _newOption(3_000e18, true);
 
-        vm.startPrank(alice);
-        router.createOrder(7, euro, false, 1 ether, 100e6, 10 minutes);
+        _sell(7, euro, _terms(euro), "");
         (IOption stored, uint40 deadline, bool isBuy, uint256 amount, uint256 premium) = router.orders(alice, 7);
         assertEq(address(stored), address(euro), "option");
         assertEq(deadline, block.timestamp + 10 minutes, "deadline");
@@ -172,30 +171,85 @@ contract PositionRouterTest is Test {
         assertFalse(isBuy, "sell");
         assertEq(premium, 100e6, "premium");
 
-        vm.expectRevert(IPositionRouter.InvalidOrder.selector);
-        router.createOrder(7, euro, false, 1 ether, 100e6, 10 minutes);
+        _sell(7, euro, _terms(euro), abi.encodeWithSelector(IPositionRouter.InvalidOrder.selector));
 
+        vm.prank(alice);
         router.cancelOrder(7);
         (,,, amount,) = router.orders(alice, 7);
         assertEq(amount, 0, "cancelled");
-        vm.stopPrank();
     }
 
     function testFork_CreateOrder_RejectsDisallowedMarkets() public {
         (IOption longDated,) = _newOption(3_000e18, true, 31 days, 1 hours);
         (IOption longWindow,) = _newOption(3_000e18, true, 1 days, 2 hours);
         IOption impostor = IOption(address(new FakeOption(address(rct))));
+        bytes memory notAllowed = abi.encodeWithSelector(IPositionRouter.MarketNotAllowed.selector);
 
-        vm.startPrank(alice);
-        vm.expectRevert(IPositionRouter.MarketNotAllowed.selector);
-        router.createOrder(1, opt, false, 1 ether, 100e6, 10 minutes); // American
-        vm.expectRevert(IPositionRouter.MarketNotAllowed.selector);
-        router.createOrder(1, longDated, false, 1 ether, 100e6, 10 minutes);
-        vm.expectRevert(IPositionRouter.MarketNotAllowed.selector);
-        router.createOrder(1, longWindow, false, 1 ether, 100e6, 10 minutes);
-        vm.expectRevert(IPositionRouter.UnknownOption.selector);
-        router.createOrder(1, impostor, false, 1 ether, 100e6, 10 minutes);
-        vm.stopPrank();
+        _sell(1, opt, _terms(opt), notAllowed); // American
+        _sell(1, longDated, _terms(longDated), notAllowed);
+        _sell(1, longWindow, _terms(longWindow), notAllowed);
+        _sell(1, impostor, _terms(opt), abi.encodeWithSelector(IPositionRouter.UnknownOption.selector));
+    }
+
+    /// @notice Each restated term must be the market's own.
+    function testFork_CreateOrder_RejectsWrongTerms() public {
+        (IOption euro,) = _newOption(3_000e18, true);
+        bytes memory mismatch = abi.encodeWithSelector(IPositionRouter.TermsMismatch.selector);
+
+        Terms memory t = _terms(euro);
+        t.strike = 1;
+        _sell(1, euro, t, mismatch);
+        t = _terms(euro);
+        t.expirationDate += 1;
+        _sell(1, euro, t, mismatch);
+        t = _terms(euro);
+        t.isPut = true;
+        _sell(1, euro, t, mismatch);
+        t = _terms(euro);
+        t.isEuro = false;
+        _sell(1, euro, t, mismatch);
+        t = _terms(euro);
+        t.windowSeconds -= 1;
+        _sell(1, euro, t, mismatch);
+    }
+
+    /// @notice The factory lets a WETH-collateral call carry `isPut = true`. With a put-range strike
+    ///         (`1e36 / 2_500e18`) it is a $0.0004 call, so the router refuses the label.
+    function testFork_CreateOrder_RejectsMislabeledPut() public {
+        IOption mislabeled = IOption(
+            FACTORY.createOption(
+                CreateParams({
+                    collateral: address(WETH),
+                    consideration: address(USDC),
+                    expirationDate: uint40(block.timestamp + 1 days),
+                    strike: 1e36 / 2_500e18,
+                    isPut: true,
+                    isEuro: true,
+                    windowSeconds: 1 hours
+                })
+            )
+        );
+        _sell(1, mislabeled, _terms(mislabeled), abi.encodeWithSelector(IPositionRouter.MarketNotAllowed.selector));
+    }
+
+    struct Terms {
+        uint256 strike;
+        uint40 expirationDate;
+        bool isPut;
+        bool isEuro;
+        uint40 windowSeconds;
+    }
+
+    function _terms(IOption option) internal view returns (Terms memory t) {
+        t = Terms(option.strike(), option.expirationDate(), option.isPut(), option.isEuro(), 0);
+        t.windowSeconds = uint40(option.exerciseDeadline() - t.expirationDate);
+    }
+
+    /// @dev Alice offers to sell 1 option for 100 USDC for 10 minutes, expecting `err` if non-empty.
+    function _sell(uint256 nonce, IOption option, Terms memory t, bytes memory err) internal {
+        if (err.length != 0) vm.expectRevert(err);
+        vm.prank(alice);
+        router.createOrder(nonce, option, t.strike, t.expirationDate, t.isPut, t.isEuro, t.windowSeconds, false, 1 ether, 100e6, 10 minutes);
     }
 
     function _newOption(uint256 strike, bool isEuro) internal returns (IOption option, IReceipt receipt) {

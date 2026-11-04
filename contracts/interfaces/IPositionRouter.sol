@@ -17,6 +17,8 @@ interface IPositionRouter {
 
     /// @notice `option` was not created by the router's factory.
     error UnknownOption();
+    /// @notice The terms passed to {createOrder} are not `option`'s own.
+    error TermsMismatch();
     /// @notice The order's market breaks the order rules.
     error MarketNotAllowed();
     /// @notice Zero amount or premium, or the nonce already holds an open order.

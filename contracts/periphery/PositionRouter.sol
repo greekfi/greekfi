@@ -3,6 +3,7 @@ pragma solidity ^0.8.30;
 
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { ReentrancyGuardTransient } from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 
 import { IFactory } from "../interfaces/IFactory.sol";
 import { IOption } from "../interfaces/IOption.sol";
@@ -34,7 +35,7 @@ import { IPositionRouter } from "../interfaces/IPositionRouter.sol";
  *         writes and sends options to any `to`, so a Roles preset must pin `to`. With BURN, options
  *         anyone sends to the account through the router net against its Receipts.
  */
-contract PositionRouter is IPositionRouter {
+contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
     /// @notice The factory whose markets this router accepts.
@@ -62,7 +63,7 @@ contract PositionRouter is IPositionRouter {
     /// @notice For each `i`, send `amounts[i]` of the caller's `options[i]` to `to`. Needs
     ///         `Perm.TRANSFER`; with `Perm.MINT` too, any shortfall is minted from the caller's
     ///         collateral allowance and the caller keeps the Receipts.
-    function transfer(IOption[] calldata options, address to, uint256[] calldata amounts) external {
+    function transfer(IOption[] calldata options, address to, uint256[] calldata amounts) external nonReentrant {
         for (uint256 i; i < options.length; ++i) {
             _receiptOf(options[i]);
             options[i].transferFrom(msg.sender, to, amounts[i]);
@@ -73,7 +74,7 @@ contract PositionRouter is IPositionRouter {
     ///         to the caller. Needs `Perm.REDEEM`. Without the grant {IReceipt.redeemFor} skips the
     ///         caller silently and this call succeeds having done nothing. Any market whose
     ///         redemption reverts reverts the whole batch.
-    function redeem(IOption[] calldata options) external {
+    function redeem(IOption[] calldata options) external nonReentrant {
         address[] memory holders = new address[](1);
         holders[0] = msg.sender;
         for (uint256 i; i < options.length; ++i) {
@@ -83,18 +84,40 @@ contract PositionRouter is IPositionRouter {
 
     /// @notice Offer to write and sell `amount` of `option` for at least `premium` USDC in total, or
     ///         with `isBuy` to buy `amount` back for at most `premium`, until `duration` seconds from
-    ///         now. The market must be European, pair {WETH} with {USDC}, and fit {MAX_TENOR} and
-    ///         {MAX_WINDOW}.
+    ///         now. The market must be European, pair {WETH} with {USDC} (a put exactly when USDC is
+    ///         the collateral), and fit {MAX_TENOR} and {MAX_WINDOW}.
+    ///
+    ///         `strike` through `windowSeconds` restate `option`'s terms and must match them exactly.
+    ///         They are in the calldata so the Roles Modifier can pin or bound them; the router
+    ///         checks them against the market. A put's `strike` is the inverted `1e36 / humanStrike`,
+    ///         so its bounds invert too.
     /// @param duration Lifetime of the order, for the Roles Modifier to cap.
-    function createOrder(uint256 nonce, IOption option, bool isBuy, uint256 amount, uint256 premium, uint32 duration) external {
+    function createOrder(
+        uint256 nonce,
+        IOption option,
+        uint256 strike,
+        uint40 expirationDate,
+        bool isPut,
+        bool isEuro,
+        uint40 windowSeconds,
+        bool isBuy,
+        uint256 amount,
+        uint256 premium,
+        uint32 duration
+    ) external {
         if (amount == 0 || premium == 0 || orders[msg.sender][nonce].amount != 0) revert InvalidOrder();
 
         IReceipt receipt = _receiptOf(option);
+        if (
+            receipt.strike() != strike || receipt.expirationDate() != expirationDate || receipt.isPut() != isPut
+                || receipt.isEuro() != isEuro || receipt.exerciseDeadline() - expirationDate != windowSeconds
+        ) revert TermsMismatch();
+
         address coll = address(receipt.collateral());
         address cons = address(receipt.consideration());
+        // `isPut` is only a label in the factory; tie it to the collateral so the side Roles pins is real.
         if (
-            !receipt.isEuro() || receipt.expirationDate() > block.timestamp + MAX_TENOR
-                || receipt.exerciseDeadline() - receipt.expirationDate() > MAX_WINDOW
+            !isEuro || expirationDate > block.timestamp + MAX_TENOR || windowSeconds > MAX_WINDOW || isPut != (coll == USDC)
                 || !((coll == WETH && cons == USDC) || (coll == USDC && cons == WETH))
         ) revert MarketNotAllowed();
 
@@ -118,7 +141,7 @@ contract PositionRouter is IPositionRouter {
         uint256 nonce,
         IBebopSettlement.SingleOrder calldata quote,
         IBebopSettlement.MakerSignature calldata makerSignature
-    ) external {
+    ) external nonReentrant {
         Order memory order = orders[account][nonce];
         if (order.amount == 0) revert UnknownOrder();
         if (block.timestamp > order.deadline) revert OrderExpired();

@@ -241,7 +241,7 @@ contract PositionRouterBebopTest is Test {
         vm.stopPrank();
         uint256 usdcBefore = USDC.balanceOf(SAFE);
 
-        assertTrue(_fromRoles(abi.encodeCall(router.createOrder, (1, put, false, size, PREMIUM, 1 days))), "create sell");
+        assertTrue(_fromRoles(_orderCall(1, put, false, size, PREMIUM, 1 days)), "create sell");
         IBebopSettlement.SingleOrder memory sell = _quote(PREMIUM);
         (sell.taker_token, sell.taker_amount) = (address(put), size);
         _submit(1, sell);
@@ -250,7 +250,7 @@ contract PositionRouterBebopTest is Test {
         assertEq(put.receipt().balanceOf(SAFE), size, "safe holds the receipts");
         assertEq(usdcBefore - USDC.balanceOf(SAFE), size - PREMIUM, "collateral locked, premium received");
 
-        assertTrue(_fromRoles(abi.encodeCall(router.createOrder, (2, put, true, size, PREMIUM, 1 days))), "create buy");
+        assertTrue(_fromRoles(_orderCall(2, put, true, size, PREMIUM, 1 days)), "create buy");
         vm.prank(maker);
         put.approve(BEBOP, size);
         IBebopSettlement.SingleOrder memory buy = _buyQuote(PREMIUM);
@@ -262,11 +262,36 @@ contract PositionRouterBebopTest is Test {
     }
 
     function _createOrder(uint256 nonce, uint256 minPremium, uint32 duration) internal {
-        assertTrue(_fromRoles(abi.encodeCall(router.createOrder, (nonce, option, false, AMOUNT, minPremium, duration))), "create");
+        assertTrue(_fromRoles(_orderCall(nonce, option, false, AMOUNT, minPremium, duration)), "create");
     }
 
     function _createBuyOrder(uint256 nonce, uint256 maxPremium) internal {
-        assertTrue(_fromRoles(abi.encodeCall(router.createOrder, (nonce, option, true, AMOUNT, maxPremium, 1 days))), "create buy");
+        assertTrue(_fromRoles(_orderCall(nonce, option, true, AMOUNT, maxPremium, 1 days)), "create buy");
+    }
+
+    /// @dev `createOrder` calldata restating `market`'s own terms, as a Roles preset would see it.
+    function _orderCall(uint256 nonce, IOption market, bool isBuy, uint256 amount, uint256 premium, uint32 duration)
+        internal
+        view
+        returns (bytes memory)
+    {
+        uint40 expiry = market.expirationDate();
+        return abi.encodeCall(
+            router.createOrder,
+            (
+                nonce,
+                market,
+                market.strike(),
+                expiry,
+                market.isPut(),
+                market.isEuro(),
+                uint40(market.exerciseDeadline() - expiry),
+                isBuy,
+                amount,
+                premium,
+                duration
+            )
+        );
     }
 
     /// @dev The maker sells the options back: it pays them, the router pays USDC.
