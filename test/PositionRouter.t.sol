@@ -8,8 +8,10 @@ import { CreateParams, IFactory } from "../contracts/interfaces/IFactory.sol";
 import { IOption } from "../contracts/interfaces/IOption.sol";
 import { IReceipt } from "../contracts/interfaces/IReceipt.sol";
 import { IBebopSettlement } from "../contracts/interfaces/IBebopSettlement.sol";
+import { IPriceFeed } from "../contracts/interfaces/IPriceFeed.sol";
 import { IPositionRouter } from "../contracts/interfaces/IPositionRouter.sol";
 import { PositionRouter } from "../contracts/periphery/PositionRouter.sol";
+import { MockPriceFeed } from "./MockPriceFeed.sol";
 
 /// @dev Claims a real market's Receipt as its own, to probe the router's back-pointer check.
 contract FakeOption {
@@ -20,12 +22,15 @@ contract FakeOption {
     }
 }
 
-/// @notice The router's transfer / redeem and order book against the deployed v1.3 factory on a mainnet fork.
+/// @notice The router's redeem and order book against the deployed v1.3 factory on a mainnet fork.
+///         Spot comes from a mock feed pinned at $3,000 unless a test says otherwise.
 contract PositionRouterTest is Test {
     IFactory constant FACTORY = IFactory(0x9999999999906A9a5B3CFB1151Ac6812B3042191); // v1.3
     address constant BEBOP = 0xbbbbbBB520d69a9775E85b458C58c648259FAD5F;
     IERC20 constant WETH = IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
     IERC20 constant USDC = IERC20(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48);
+    /// @dev Chainlink ETH / USD.
+    IPriceFeed constant CHAINLINK_ETH_USD = IPriceFeed(0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419);
 
     // `Perm` bits from the v1.3 factory (greekfi/contracts c7200d4, contracts/Permissions.sol).
     uint256 constant TRANSFER = 1 << 0;
@@ -34,6 +39,7 @@ contract PositionRouterTest is Test {
     uint256 constant ALL_ROUTER_BITS = TRANSFER | MINT | REDEEM;
 
     PositionRouter router;
+    MockPriceFeed feed;
     IOption opt;
     IReceipt rct;
     address alice = makeAddr("alice");
@@ -42,7 +48,8 @@ contract PositionRouterTest is Test {
 
     function setUp() public {
         vm.createSelectFork(vm.envOr("ETH_RPC_URL", string("https://ethereum-rpc.publicnode.com")));
-        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC));
+        feed = new MockPriceFeed();
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC), feed);
         (opt, rct) = _newOption(3_000e18, false);
 
         address[3] memory who = [alice, bob, mallory];
@@ -56,29 +63,13 @@ contract PositionRouterTest is Test {
         }
     }
 
-    function testFork_Transfer_MintsShortfallAndKeepsReceipts() public {
-        _grant(alice, TRANSFER | MINT);
-        _mint(opt, alice, 4 ether);
-
-        vm.prank(alice);
-        router.transfer(_opts(opt), bob, _amts(10 ether));
-
-        assertEq(opt.balanceOf(bob), 10 ether, "bob holds the options");
-        assertEq(opt.balanceOf(alice), 0, "alice sent her own first");
-        assertEq(rct.balanceOf(alice), 10 ether, "alice keeps every receipt");
-    }
-
-    /// @notice One call writes and sends across two markets; one later call redeems both.
-    function testFork_Batch_SpansMarkets() public {
-        _grant(alice, ALL_ROUTER_BITS);
+    /// @notice One call redeems across two markets.
+    function testFork_Redeem_SpansMarkets() public {
+        _grant(alice, REDEEM);
         (IOption opt2, IReceipt rct2) = _newOption(3_500e18, false);
         uint256 wethBefore = WETH.balanceOf(alice);
-
-        vm.prank(alice);
-        router.transfer(_opts(opt, opt2), bob, _amts(10 ether, 5 ether));
-
-        assertEq(opt.balanceOf(bob) + opt2.balanceOf(bob), 15 ether, "bob holds both");
-        assertEq(wethBefore - WETH.balanceOf(alice), 15 ether, "collateral locked");
+        _mint(opt, alice, 10 ether);
+        _mint(opt2, alice, 5 ether);
 
         vm.warp(rct.exerciseDeadline() + 1);
         vm.prank(alice);
@@ -86,13 +77,6 @@ contract PositionRouterTest is Test {
 
         assertEq(rct.balanceOf(alice) + rct2.balanceOf(alice), 0, "both redeemed");
         assertEq(WETH.balanceOf(alice), wethBefore, "all collateral back");
-    }
-
-    function testFork_Transfer_RequiresGrant() public {
-        _mint(opt, alice, 1 ether);
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSignature("ERC20InsufficientAllowance(address,uint256,uint256)", address(router), 0, 1 ether));
-        router.transfer(_opts(opt), bob, _amts(1 ether));
     }
 
     function testFork_Redeem_PaysCallerAfterPartialExercise() public {
@@ -131,11 +115,6 @@ contract PositionRouterTest is Test {
         _grant(alice, ALL_ROUTER_BITS);
         _mint(opt, alice, 10 ether);
 
-        vm.prank(mallory);
-        // mallory never granted the router, so it can only ever reach mallory's own tokens.
-        vm.expectRevert(abi.encodeWithSignature("ERC20InsufficientAllowance(address,uint256,uint256)", address(router), 0, 1 ether));
-        router.transfer(_opts(opt), mallory, _amts(1 ether));
-
         vm.warp(rct.exerciseDeadline() + 1);
         vm.prank(mallory);
         router.redeem(_opts(opt));
@@ -146,18 +125,20 @@ contract PositionRouterTest is Test {
 
     /// @notice One foreign market anywhere in the list reverts the whole batch.
     function testFork_RejectsMarketsOutsideFactory() public {
-        _grant(alice, ALL_ROUTER_BITS);
+        _grant(alice, REDEEM);
+        _mint(opt, alice, 1 ether);
         IOption impostor = IOption(address(new FakeOption(address(rct))));
         IOption unregistered = IOption(address(new FakeOption(address(0xdead))));
+        vm.warp(rct.exerciseDeadline() + 1);
 
         vm.startPrank(alice);
         vm.expectRevert(IPositionRouter.UnknownOption.selector);
-        router.transfer(_opts(opt, impostor), bob, _amts(1 ether, 1 ether));
+        router.redeem(_opts(opt, impostor));
         vm.expectRevert(IPositionRouter.UnknownOption.selector);
         router.redeem(_opts(unregistered));
         vm.stopPrank();
 
-        assertEq(opt.balanceOf(bob), 0, "first leg rolled back");
+        assertEq(rct.balanceOf(alice), 1 ether, "first leg rolled back");
     }
 
     function testFork_CreateOrder_StoresAndCancels() public {
@@ -186,27 +167,108 @@ contract PositionRouterTest is Test {
         Terms memory t = _terms(euro);
         bytes memory invalid = abi.encodeWithSelector(IPositionRouter.InvalidOrder.selector);
 
-        _order(1, euro, t, false, 1.5 ether, 100e6, "");
+        _order(1, euro, t, false, 1.5 ether, 100e6, 10 minutes, "");
         assertEq(_premium(1), 150e6, "1.5 options at 100 USDC");
 
-        _order(2, euro, t, false, 1, 100e6, "");
+        _order(2, euro, t, false, 1, 100e6, 10 minutes, "");
         assertEq(_premium(2), 1, "a 1-wei sell's floor rounds up");
 
-        _order(3, euro, t, true, 1, 100e6, invalid); // a 1-wei buy's cap rounds down to 0
+        _order(3, euro, t, true, 1, 100e6, 10 minutes, invalid); // a 1-wei buy's cap rounds down to 0
 
-        _order(4, euro, t, false, 1 ether, 0, invalid);
+        _order(4, euro, t, false, 1 ether, 0, 10 minutes, invalid);
     }
 
     function testFork_CreateOrder_RejectsDisallowedMarkets() public {
-        (IOption longDated,) = _newOption(3_000e18, true, 31 days, 1 hours);
         (IOption longWindow,) = _newOption(3_000e18, true, 1 days, 2 hours);
         IOption impostor = IOption(address(new FakeOption(address(rct))));
         bytes memory notAllowed = abi.encodeWithSelector(IPositionRouter.MarketNotAllowed.selector);
 
         _sell(1, opt, _terms(opt), notAllowed); // American
-        _sell(1, longDated, _terms(longDated), notAllowed);
         _sell(1, longWindow, _terms(longWindow), notAllowed);
         _sell(1, impostor, _terms(opt), abi.encodeWithSelector(IPositionRouter.UnknownOption.selector));
+    }
+
+    /// @notice Markets may expire up to MAX_TENOR (35 days) out.
+    function testFork_CreateOrder_TenorUpTo35Days() public {
+        (IOption at35,) = _newOption(3_000e18, true, 35 days, 1 hours);
+        (IOption past35,) = _newOption(3_000e18, true, 35 days + 1, 1 hours);
+
+        _sell(1, at35, _terms(at35), "");
+        _sell(2, past35, _terms(past35), abi.encodeWithSelector(IPositionRouter.MarketNotAllowed.selector));
+    }
+
+    /// @notice An order must end at least EXPIRY_BUFFER before its market expires, so an expired
+    ///         market can't be ordered at all.
+    function testFork_CreateOrder_EndsBeforeExpiry() public {
+        (IOption euro,) = _newOption(3_000e18, true); // expires in 1 day
+        Terms memory t = _terms(euro);
+        uint32 latest = uint32(1 days - router.EXPIRY_BUFFER());
+        bytes memory outlives = abi.encodeWithSelector(IPositionRouter.OrderOutlivesMarket.selector);
+
+        _order(1, euro, t, false, 1 ether, 100e6, latest, "");
+        _order(2, euro, t, false, 1 ether, 100e6, latest + 1, outlives);
+
+        vm.warp(t.expirationDate + 1);
+        _order(3, euro, t, false, 1 ether, 100e6, 0, outlives);
+    }
+
+    /// @notice With spot at $3,000, a call's strike must sit in [$1,500, $4,500].
+    function testFork_CreateOrder_CallStrikeWithinBand() public {
+        bytes memory outOfRange = abi.encodeWithSelector(IPositionRouter.StrikeOutOfRange.selector);
+        (IOption low,) = _newOption(1_500e18, true);
+        (IOption high,) = _newOption(4_500e18, true);
+        (IOption tooLow,) = _newOption(1_499e18, true);
+        (IOption tooHigh,) = _newOption(4_501e18, true);
+
+        _sell(1, low, _terms(low), "");
+        _sell(2, high, _terms(high), "");
+        _sell(3, tooLow, _terms(tooLow), outOfRange);
+        _sell(4, tooHigh, _terms(tooHigh), outOfRange);
+    }
+
+    /// @notice A put's stored strike is inverted, so the band applies to `1e36 / strike`.
+    function testFork_CreateOrder_PutStrikeWithinBand() public {
+        IOption inBand = _newPut(2_000e18);
+        IOption outOfBand = _newPut(1_400e18);
+
+        _sell(1, inBand, _terms(inBand), "");
+        _sell(2, outOfBand, _terms(outOfBand), abi.encodeWithSelector(IPositionRouter.StrikeOutOfRange.selector));
+    }
+
+    /// @notice The band moves with spot.
+    function testFork_CreateOrder_BandFollowsSpot() public {
+        (IOption euro,) = _newOption(3_000e18, true);
+        feed.set(7_000e8); // band is now [$3,500, $10,500]
+
+        _sell(1, euro, _terms(euro), abi.encodeWithSelector(IPositionRouter.StrikeOutOfRange.selector));
+    }
+
+    function testFork_CreateOrder_RejectsBadOraclePrice() public {
+        (IOption euro,) = _newOption(3_000e18, true);
+        bytes memory stale = abi.encodeWithSelector(IPositionRouter.StalePrice.selector);
+
+        feed.setAge(router.ORACLE_MAX_AGE());
+        _sell(1, euro, _terms(euro), "");
+
+        feed.setAge(router.ORACLE_MAX_AGE() + 1);
+        _sell(2, euro, _terms(euro), stale);
+
+        feed.setAge(0);
+        feed.set(0);
+        _sell(3, euro, _terms(euro), stale);
+    }
+
+    /// @notice Against the live Chainlink ETH / USD feed: a strike at spot passes, one at twice
+    ///         spot does not.
+    function testFork_CreateOrder_LiveChainlinkFeed() public {
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC), CHAINLINK_ETH_USD);
+        (, int256 answer,,,) = CHAINLINK_ETH_USD.latestRoundData();
+        uint256 spot = uint256(answer) / 1e8 * 1e18; // whole dollars, 18 decimals
+        (IOption atSpot,) = _newOption(spot, true);
+        (IOption twiceSpot,) = _newOption(2 * spot, true);
+
+        _sell(1, atSpot, _terms(atSpot), "");
+        _sell(2, twiceSpot, _terms(twiceSpot), abi.encodeWithSelector(IPositionRouter.StrikeOutOfRange.selector));
     }
 
     /// @notice Each restated term must be the market's own.
@@ -265,13 +327,22 @@ contract PositionRouterTest is Test {
 
     /// @dev Alice offers to sell 1 option at 100 USDC for 10 minutes, expecting `err` if non-empty.
     function _sell(uint256 nonce, IOption option, Terms memory t, bytes memory err) internal {
-        _order(nonce, option, t, false, 1 ether, 100e6, err);
+        _order(nonce, option, t, false, 1 ether, 100e6, 10 minutes, err);
     }
 
-    function _order(uint256 nonce, IOption option, Terms memory t, bool isBuy, uint256 amount, uint256 price, bytes memory err) internal {
+    function _order(
+        uint256 nonce,
+        IOption option,
+        Terms memory t,
+        bool isBuy,
+        uint256 amount,
+        uint256 price,
+        uint32 duration,
+        bytes memory err
+    ) internal {
         if (err.length != 0) vm.expectRevert(err);
         vm.prank(alice);
-        router.createOrder(nonce, option, t.strike, t.expirationDate, t.isPut, t.isEuro, t.windowSeconds, isBuy, amount, price, 10 minutes);
+        router.createOrder(nonce, option, t.strike, t.expirationDate, t.isPut, t.isEuro, t.windowSeconds, isBuy, amount, price, duration);
     }
 
     function _premium(uint256 nonce) internal view returns (uint256 premium) {
@@ -299,6 +370,23 @@ contract PositionRouterTest is Test {
         receipt = option.receipt();
     }
 
+    /// @dev A European cash-secured put at `humanStrike` USD per ETH.
+    function _newPut(uint256 humanStrike) internal returns (IOption) {
+        return IOption(
+            FACTORY.createOption(
+                CreateParams({
+                    collateral: address(USDC),
+                    consideration: address(WETH),
+                    expirationDate: uint40(block.timestamp + 1 days),
+                    strike: 1e36 / humanStrike,
+                    isPut: true,
+                    isEuro: true,
+                    windowSeconds: 1 hours
+                })
+            )
+        );
+    }
+
     function _mint(IOption option, address who, uint256 amount) internal {
         vm.prank(who);
         option.mint(amount);
@@ -316,16 +404,6 @@ contract PositionRouterTest is Test {
 
     function _opts(IOption a, IOption b) internal pure returns (IOption[] memory list) {
         list = new IOption[](2);
-        (list[0], list[1]) = (a, b);
-    }
-
-    function _amts(uint256 a) internal pure returns (uint256[] memory list) {
-        list = new uint256[](1);
-        list[0] = a;
-    }
-
-    function _amts(uint256 a, uint256 b) internal pure returns (uint256[] memory list) {
-        list = new uint256[](2);
         (list[0], list[1]) = (a, b);
     }
 }

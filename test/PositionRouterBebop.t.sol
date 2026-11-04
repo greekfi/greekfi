@@ -10,6 +10,7 @@ import { IBebopSettlement } from "../contracts/interfaces/IBebopSettlement.sol";
 import { ISafe } from "../contracts/interfaces/ISafe.sol";
 import { IPositionRouter } from "../contracts/interfaces/IPositionRouter.sol";
 import { PositionRouter } from "../contracts/periphery/PositionRouter.sol";
+import { MockPriceFeed } from "./MockPriceFeed.sol";
 
 /// @notice Mainnet-fork proof that the ENS Endowment Safe can post a limit order through its Roles
 ///         Modifier, and that anyone can later fill it with a fresh Bebop quote: the option mints just
@@ -36,6 +37,8 @@ contract PositionRouterBebopTest is Test {
     uint256 constant NONCE = 1;
 
     PositionRouter router;
+    /// @dev Spot pinned at $3,000.
+    MockPriceFeed feed;
     IOption option;
     address maker;
     address keeper = makeAddr("keeper");
@@ -43,7 +46,8 @@ contract PositionRouterBebopTest is Test {
     function setUp() public {
         vm.createSelectFork(vm.envOr("ETH_RPC_URL", string("https://ethereum-rpc.publicnode.com")));
 
-        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC));
+        feed = new MockPriceFeed();
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC), feed);
         option = IOption(
             FACTORY.createOption(
                 CreateParams({
@@ -192,6 +196,26 @@ contract PositionRouterBebopTest is Test {
 
         assertEq(option.balanceOf(SAFE), AMOUNT, "options returned");
         assertEq(option.receipt().balanceOf(SAFE), AMOUNT, "receipts kept");
+    }
+
+    /// @notice A resting sell re-checks the strike band at fill: once spot runs to $7,000, the $3,000
+    ///         call is deep in the money and the order can no longer fill.
+    function testFork_SellBlockedWhenSpotLeavesBand() public {
+        _createOrder(NONCE, PREMIUM, 1 days);
+        feed.set(7_000e8);
+
+        _submitExpectingRevert(NONCE, _quote(PREMIUM), abi.encodeWithSelector(IPositionRouter.StrikeOutOfRange.selector));
+    }
+
+    /// @notice A buy-back skips the fill-time band, so a position that moved far from spot can still close.
+    function testFork_BuyBackFillsWhenSpotLeavesBand() public {
+        _sellThenReadyBuyBack(true);
+        _createBuyOrder(2, PREMIUM);
+        feed.set(7_000e8);
+
+        _submit(2, _buyQuote(PREMIUM));
+
+        assertEq(option.receipt().balanceOf(SAFE), 0, "position closed");
     }
 
     function testFork_BuyAboveLimitReverts() public {
