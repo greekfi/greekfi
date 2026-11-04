@@ -179,6 +179,24 @@ contract PositionRouterTest is Test {
         assertEq(amount, 0, "cancelled");
     }
 
+    /// @notice The total is the per-option price times the size, rounded in the account's favour,
+    ///         so a dust order can't sell for nothing or buy for a full cap (the old H-01 path).
+    function testFork_CreateOrder_PricesPerOption() public {
+        (IOption euro,) = _newOption(3_000e18, true);
+        Terms memory t = _terms(euro);
+        bytes memory invalid = abi.encodeWithSelector(IPositionRouter.InvalidOrder.selector);
+
+        _order(1, euro, t, false, 1.5 ether, 100e6, "");
+        assertEq(_premium(1), 150e6, "1.5 options at 100 USDC");
+
+        _order(2, euro, t, false, 1, 100e6, "");
+        assertEq(_premium(2), 1, "a 1-wei sell's floor rounds up");
+
+        _order(3, euro, t, true, 1, 100e6, invalid); // a 1-wei buy's cap rounds down to 0
+
+        _order(4, euro, t, false, 1 ether, 0, invalid);
+    }
+
     function testFork_CreateOrder_RejectsDisallowedMarkets() public {
         (IOption longDated,) = _newOption(3_000e18, true, 31 days, 1 hours);
         (IOption longWindow,) = _newOption(3_000e18, true, 1 days, 2 hours);
@@ -245,11 +263,19 @@ contract PositionRouterTest is Test {
         t.windowSeconds = uint40(option.exerciseDeadline() - t.expirationDate);
     }
 
-    /// @dev Alice offers to sell 1 option for 100 USDC for 10 minutes, expecting `err` if non-empty.
+    /// @dev Alice offers to sell 1 option at 100 USDC for 10 minutes, expecting `err` if non-empty.
     function _sell(uint256 nonce, IOption option, Terms memory t, bytes memory err) internal {
+        _order(nonce, option, t, false, 1 ether, 100e6, err);
+    }
+
+    function _order(uint256 nonce, IOption option, Terms memory t, bool isBuy, uint256 amount, uint256 price, bytes memory err) internal {
         if (err.length != 0) vm.expectRevert(err);
         vm.prank(alice);
-        router.createOrder(nonce, option, t.strike, t.expirationDate, t.isPut, t.isEuro, t.windowSeconds, false, 1 ether, 100e6, 10 minutes);
+        router.createOrder(nonce, option, t.strike, t.expirationDate, t.isPut, t.isEuro, t.windowSeconds, isBuy, amount, price, 10 minutes);
+    }
+
+    function _premium(uint256 nonce) internal view returns (uint256 premium) {
+        (,,,, premium) = router.orders(alice, nonce);
     }
 
     function _newOption(uint256 strike, bool isEuro) internal returns (IOption option, IReceipt receipt) {

@@ -270,12 +270,14 @@ contract PositionRouterBebopTest is Test {
     }
 
     /// @dev `createOrder` calldata restating `market`'s own terms, as a Roles preset would see it.
+    ///      Takes the order's total `premium` and passes the per-option price it implies.
     function _orderCall(uint256 nonce, IOption market, bool isBuy, uint256 amount, uint256 premium, uint32 duration)
         internal
         view
         returns (bytes memory)
     {
         uint40 expiry = market.expirationDate();
+        uint256 price = premium * 10 ** market.decimals() / amount;
         return abi.encodeCall(
             router.createOrder,
             (
@@ -288,7 +290,7 @@ contract PositionRouterBebopTest is Test {
                 uint40(market.exerciseDeadline() - expiry),
                 isBuy,
                 amount,
-                premium,
+                price,
                 duration
             )
         );

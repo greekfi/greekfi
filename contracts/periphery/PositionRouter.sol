@@ -3,6 +3,7 @@ pragma solidity ^0.8.30;
 
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { ReentrancyGuardTransient } from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 
 import { IFactory } from "../interfaces/IFactory.sol";
@@ -23,7 +24,7 @@ import { IPositionRouter } from "../interfaces/IPositionRouter.sol";
  *         {FACTORY}, then act on `msg.sender`'s own position only.
  *
  *         {createOrder} stores a limit order to sell freshly written options for at least a minimum
- *         USDC premium, or to buy options back for at most a maximum. Anyone may then {submitOrder} a
+ *         USDC price per option, or to buy options back for at most a maximum. Anyone may then {submitOrder} a
  *         Bebop quote that fits it, with the router as taker. A sell mints the options from the
  *         account and the premium goes straight to the account. A buy pulls the USDC from the account
  *         and sends the options on to it, pair-burning them against its Receipts. The router holds
@@ -82,15 +83,18 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
         }
     }
 
-    /// @notice Offer to write and sell `amount` of `option` for at least `premium` USDC in total, or
-    ///         with `isBuy` to buy `amount` back for at most `premium`, until `duration` seconds from
-    ///         now. The market must be European, pair {WETH} with {USDC} (a put exactly when USDC is
-    ///         the collateral), and fit {MAX_TENOR} and {MAX_WINDOW}.
+    /// @notice Offer to write and sell `amount` of `option` for at least `price` USDC per option, or
+    ///         with `isBuy` to buy `amount` back for at most `price` per option, until `duration`
+    ///         seconds from now. The market must be European, pair {WETH} with {USDC} (a put exactly
+    ///         when USDC is the collateral), and fit {MAX_TENOR} and {MAX_WINDOW}.
     ///
     ///         `strike` through `windowSeconds` restate `option`'s terms and must match them exactly.
     ///         They are in the calldata so the Roles Modifier can pin or bound them; the router
     ///         checks them against the market. A put's `strike` is the inverted `1e36 / humanStrike`,
     ///         so its bounds invert too.
+    /// @param price    USDC base units per whole option (`10 ** option.decimals()` units): a sell's
+    ///                 floor or a buy's cap, for the Roles Modifier to bound. The stored total rounds in
+    ///                 the account's favour, up for a sell and down for a buy.
     /// @param duration Lifetime of the order, for the Roles Modifier to cap.
     function createOrder(
         uint256 nonce,
@@ -102,10 +106,10 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
         uint40 windowSeconds,
         bool isBuy,
         uint256 amount,
-        uint256 premium,
+        uint256 price,
         uint32 duration
     ) external {
-        if (amount == 0 || premium == 0 || orders[msg.sender][nonce].amount != 0) revert InvalidOrder();
+        if (amount == 0 || orders[msg.sender][nonce].amount != 0) revert InvalidOrder();
 
         IReceipt receipt = _receiptOf(option);
         if (
@@ -120,6 +124,9 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
             !isEuro || expirationDate > block.timestamp + MAX_TENOR || windowSeconds > MAX_WINDOW || isPut != (coll == USDC)
                 || !((coll == WETH && cons == USDC) || (coll == USDC && cons == WETH))
         ) revert MarketNotAllowed();
+
+        uint256 premium = Math.mulDiv(amount, price, 10 ** option.decimals(), isBuy ? Math.Rounding.Floor : Math.Rounding.Ceil);
+        if (premium == 0) revert InvalidOrder();
 
         uint40 deadline = uint40(block.timestamp + duration);
         orders[msg.sender][nonce] = Order(option, deadline, isBuy, amount, premium);

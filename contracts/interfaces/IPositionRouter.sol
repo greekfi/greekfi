@@ -6,7 +6,8 @@ import { IOption } from "./IOption.sol";
 /// @notice Types, errors and events of the PositionRouter demo.
 interface IPositionRouter {
     /// @param isBuy   Buy `amount` options back instead of writing and selling them.
-    /// @param premium Total USDC: the least a sell receives, or the most a buy pays.
+    /// @param premium Total USDC: the least a sell receives, or the most a buy pays. Set at creation
+    ///                from the per-option price.
     struct Order {
         IOption option;
         uint40 deadline;
@@ -21,7 +22,7 @@ interface IPositionRouter {
     error TermsMismatch();
     /// @notice The order's market breaks the order rules.
     error MarketNotAllowed();
-    /// @notice Zero amount or premium, or the nonce already holds an open order.
+    /// @notice Zero amount or total premium, or the nonce already holds an open order.
     error InvalidOrder();
     /// @notice No open order at this account and nonce.
     error UnknownOrder();
