@@ -24,7 +24,7 @@ interface IPositionRouter {
     error MarketNotAllowed();
     /// @notice Zero amount or total premium, or the nonce already holds an open order.
     error InvalidOrder();
-    /// @notice The order's deadline is after its market's expiry.
+    /// @notice The order's deadline falls within `EXPIRY_BUFFER` of its market's expiry.
     error OrderOutlivesMarket();
     /// @notice The market's strike is more than `STRIKE_BAND_BPS` from the oracle's spot price.
     error StrikeOutOfRange();

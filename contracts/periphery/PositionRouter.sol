@@ -60,6 +60,8 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     uint256 public constant MAX_TENOR = 35 days;
     /// @notice Longest post-expiry exercise window an order's market may have.
     uint256 public constant MAX_WINDOW = 1 hours;
+    /// @notice An order's deadline must fall at least this long before its market expires.
+    uint256 public constant EXPIRY_BUFFER = 1 hours;
     /// @notice Widest an order's strike may sit from spot, in basis points of spot (50%).
     uint256 public constant STRIKE_BAND_BPS = 5_000;
     /// @notice Oldest {ORACLE} answer the router accepts. The ETH / USD feed's heartbeat is 1 hour.
@@ -92,8 +94,9 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     /// @notice Offer to write and sell `amount` of `option` for at least `price` USDC per option, or
     ///         with `isBuy` to buy `amount` back for at most `price` per option, until `duration`
     ///         seconds from now. The market must be European, pair {WETH} with {USDC} (a put exactly
-    ///         when USDC is the collateral), fit {MAX_TENOR} and {MAX_WINDOW}, not expire before the
-    ///         order's deadline, and have its strike within {STRIKE_BAND_BPS} of spot.
+    ///         when USDC is the collateral), fit {MAX_TENOR} and {MAX_WINDOW}, expire at least
+    ///         {EXPIRY_BUFFER} after the order's deadline, and have its strike within
+    ///         {STRIKE_BAND_BPS} of spot.
     ///
     ///         `strike` through `windowSeconds` restate `option`'s terms and must match them exactly.
     ///         They are in the calldata so the Roles Modifier can pin or bound them; the router
@@ -133,8 +136,8 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
         ) revert MarketNotAllowed();
 
         uint40 deadline = uint40(block.timestamp + duration);
-        // No fill comes after `deadline`, so none comes after expiry either.
-        if (deadline > expirationDate) revert OrderOutlivesMarket();
+        // Fixed for the order's life: no fill comes after `deadline`, so none comes this close to expiry.
+        if (uint256(deadline) + EXPIRY_BUFFER > expirationDate) revert OrderOutlivesMarket();
 
         _checkStrike(strike, isPut);
 
