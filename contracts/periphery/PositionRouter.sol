@@ -2,6 +2,7 @@
 pragma solidity ^0.8.30;
 
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { IERC20Metadata } from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { ReentrancyGuardTransient } from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
@@ -32,7 +33,10 @@ import { IPositionRouter } from "../interfaces/IPositionRouter.sol";
  *         holds tokens only inside that call.
  *
  *         Every order's strike must sit within {STRIKE_BAND_BPS} of the {ORACLE} spot price, checked
- *         when the order is created and again when a sell fills.
+ *         when the order is created and again when a sell fills. Every order's price is checked
+ *         against the option's value at spot when the order is created: a sell may not go below
+ *         intrinsic value, and a buy-back may not pay more than intrinsic plus {MAX_TIME_VALUE_BPS}
+ *         of time value (see {priceBounds}).
  *
  *         Setup: approve collateral to the factory (the approval caps what all orders can write) and
  *         USDC to the router (it caps what buys can spend), then
@@ -55,17 +59,26 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     IPriceFeed public immutable ORACLE;
     /// @dev Scales an {ORACLE} answer to 18 decimals, the strike's scale.
     uint256 private immutable ORACLE_SCALE;
+    /// @dev One whole USDC in base units.
+    uint256 private immutable USDC_UNIT;
 
     /// @notice Longest time to expiration an order's market may have.
     uint256 public constant MAX_TENOR = 35 days;
     /// @notice Longest post-expiry exercise window an order's market may have.
     uint256 public constant MAX_WINDOW = 1 hours;
-    /// @notice An order's deadline must fall at least this long before its market expires.
-    uint256 public constant EXPIRY_BUFFER = 1 hours;
+    /// @notice An order's deadline may fall at most this long after its market expires. Sells stop
+    ///         filling at expiry anyway, since the Option refuses to mint from then on; buy-backs
+    ///         (pair-burns) can still fill until the deadline.
+    uint256 public constant EXPIRY_BUFFER = 2 hours;
     /// @notice Widest an order's strike may sit from spot, in basis points of spot (50%).
     uint256 public constant STRIKE_BAND_BPS = 5_000;
     /// @notice Oldest {ORACLE} answer the router accepts. The ETH / USD feed's heartbeat is 1 hour.
     uint256 public constant ORACLE_MAX_AGE = 2 hours;
+    /// @notice Most time value a buy-back may pay on top of intrinsic value, in basis points of the
+    ///         underlying's value per square root of a year. An at-the-money option is worth about
+    ///         `0.4 * vol * sqrt(t)` of its underlying, so 4,000 is an at-the-money option at 100%
+    ///         vol: 12.4% of spot at 35 days, 2.1% at 1 day, nothing from expiry on.
+    uint256 public constant MAX_TIME_VALUE_BPS = 4_000;
 
     /// @notice Open limit orders by account and account-chosen nonce.
     mapping(address account => mapping(uint256 nonce => Order)) public orders;
@@ -77,6 +90,7 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
         USDC = usdc_;
         ORACLE = oracle_;
         ORACLE_SCALE = 10 ** (18 - oracle_.decimals());
+        USDC_UNIT = 10 ** IERC20Metadata(usdc_).decimals();
     }
 
     /// @notice Redeem the caller's full Receipt balance in each of `options`' markets; proceeds go
@@ -94,9 +108,11 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     /// @notice Offer to write and sell `amount` of `option` for at least `price` USDC per option, or
     ///         with `isBuy` to buy `amount` back for at most `price` per option, until `duration`
     ///         seconds from now. The market must be European, pair {WETH} with {USDC} (a put exactly
-    ///         when USDC is the collateral), fit {MAX_TENOR} and {MAX_WINDOW}, expire at least
-    ///         {EXPIRY_BUFFER} after the order's deadline, and have its strike within
-    ///         {STRIKE_BAND_BPS} of spot.
+    ///         when USDC is the collateral), fit {MAX_TENOR} and {MAX_WINDOW}, expire no more than
+    ///         {EXPIRY_BUFFER} before the order's deadline, and have its strike within
+    ///         {STRIKE_BAND_BPS} of spot. `price` must sit within {priceBounds} at spot now: at least
+    ///         intrinsic value for a sell, at most intrinsic plus {MAX_TIME_VALUE_BPS} time value for a
+    ///         buy. Neither bound is checked again at fill.
     ///
     ///         `strike` through `windowSeconds` restate `option`'s terms and must match them exactly.
     ///         They are in the calldata so the Roles Modifier can pin or bound them; the router
@@ -136,10 +152,13 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
         ) revert MarketNotAllowed();
 
         uint40 deadline = uint40(block.timestamp + duration);
-        // Fixed for the order's life: no fill comes after `deadline`, so none comes this close to expiry.
-        if (uint256(deadline) + EXPIRY_BUFFER > expirationDate) revert OrderOutlivesMarket();
+        // Fixed for the order's life: no fill comes after `deadline`, so none comes later than this after expiry.
+        if (deadline > uint256(expirationDate) + EXPIRY_BUFFER) revert OrderOutlivesMarket();
 
-        _checkStrike(strike, isPut);
+        uint256 spot = _spot();
+        _checkStrike(strike, isPut, spot);
+        (uint256 minSellPrice, uint256 maxBuyPrice) = _priceBounds(strike, isPut, expirationDate, windowSeconds, spot);
+        if (isBuy ? price > maxBuyPrice : price < minSellPrice) revert PriceOutOfBounds();
 
         uint256 premium = Math.mulDiv(amount, price, 10 ** option.decimals(), isBuy ? Math.Rounding.Floor : Math.Rounding.Ceil);
         if (premium == 0) revert InvalidOrder();
@@ -190,7 +209,7 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
         IBebopSettlement.SingleOrder calldata quote,
         IBebopSettlement.MakerSignature calldata makerSignature
     ) private returns (uint256 premium) {
-        _checkStrike(order.option.strike(), order.option.isPut());
+        _checkStrike(order.option.strike(), order.option.isPut(), _spot());
 
         // Read after the mint: a put's collateral is USDC too, and must not count against the premium.
         order.option.transferFrom(account, address(this), order.amount);
@@ -223,12 +242,50 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
         order.option.transfer(account, order.amount);
     }
 
-    /// @dev Reverts unless the market's strike, as USD per ETH, is within {STRIKE_BAND_BPS} of the
-    ///      {ORACLE} spot. A put stores `1e36 / humanStrike`, so it is inverted back first.
-    function _checkStrike(uint256 strike, bool isPut) private view {
+    /// @notice The price range {createOrder} accepts for `option` right now, in USDC base units per
+    ///         whole option: a sell's `price` must be at least `minSellPrice` (intrinsic value at
+    ///         spot), a buy's at most `maxBuyPrice` (intrinsic plus {MAX_TIME_VALUE_BPS} time value).
+    ///         Both are 0 once the exercise window has closed.
+    function priceBounds(IOption option) external view returns (uint256 minSellPrice, uint256 maxBuyPrice) {
+        IReceipt receipt = _receiptOf(option);
+        uint40 expirationDate = receipt.expirationDate();
+        return _priceBounds(receipt.strike(), receipt.isPut(), expirationDate, uint40(receipt.exerciseDeadline() - expirationDate), _spot());
+    }
+
+    /// @dev Values one whole option at `spot` in USDC base units. A call is on 1 WETH. A put is on
+    ///      1 USDC of collateral, exercised by paying `1 / humanStrike` WETH, so its underlying is worth
+    ///      `spot / humanStrike` USDC. Intrinsic value is the in-the-money gap on that underlying; the
+    ///      time-value cap is {MAX_TIME_VALUE_BPS} of the underlying's value, scaled by the square root
+    ///      of the time left in years. After the exercise window the option is worth nothing.
+    function _priceBounds(uint256 strike, bool isPut, uint40 expirationDate, uint40 windowSeconds, uint256 spot)
+        private
+        view
+        returns (uint256 intrinsic, uint256 cap)
+    {
+        if (block.timestamp > uint256(expirationDate) + windowSeconds) return (0, 0);
+        uint256 humanStrike = isPut ? 1e36 / strike : strike;
+        // A call is on 1 ETH; a put on `1 / humanStrike` ETH. Both 18 decimals, like spot and strike.
+        uint256 per = isPut ? humanStrike : 1e18;
+        uint256 itm = isPut ? (humanStrike > spot ? humanStrike - spot : 0) : (spot > humanStrike ? spot - humanStrike : 0);
+        intrinsic = Math.mulDiv(itm, USDC_UNIT, per);
+
+        uint256 timeLeft = block.timestamp < expirationDate ? expirationDate - block.timestamp : 0;
+        // sqrt(timeLeft / 1 year), 18 decimals.
+        uint256 sqrtYears = Math.sqrt(timeLeft * 1e36 / 365 days);
+        uint256 underlying = Math.mulDiv(spot, USDC_UNIT, per);
+        cap = intrinsic + Math.mulDiv(underlying, MAX_TIME_VALUE_BPS * sqrtYears, 10_000 * 1e18);
+    }
+
+    /// @dev The {ORACLE} spot as USD per ETH, 18 decimals. Reverts on a non-positive or stale answer.
+    function _spot() private view returns (uint256) {
         (, int256 answer,, uint256 updatedAt,) = ORACLE.latestRoundData();
         if (answer <= 0 || block.timestamp - updatedAt > ORACLE_MAX_AGE) revert StalePrice();
-        uint256 spot = uint256(answer) * ORACLE_SCALE;
+        return uint256(answer) * ORACLE_SCALE;
+    }
+
+    /// @dev Reverts unless the market's strike, as USD per ETH, is within {STRIKE_BAND_BPS} of
+    ///      `spot`. A put stores `1e36 / humanStrike`, so it is inverted back first.
+    function _checkStrike(uint256 strike, bool isPut, uint256 spot) private pure {
         uint256 humanStrike = isPut ? 1e36 / strike : strike;
         uint256 band = spot * STRIKE_BAND_BPS / 10_000;
         if (humanStrike < spot - band || humanStrike > spot + band) revert StrikeOutOfRange();

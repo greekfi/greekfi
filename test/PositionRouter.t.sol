@@ -173,7 +173,7 @@ contract PositionRouterTest is Test {
         _order(2, euro, t, false, 1, 100e6, 10 minutes, "");
         assertEq(_premium(2), 1, "a 1-wei sell's floor rounds up");
 
-        _order(3, euro, t, true, 1, 100e6, 10 minutes, invalid); // a 1-wei buy's cap rounds down to 0
+        _order(3, euro, t, true, 1, 50e6, 10 minutes, invalid); // a 1-wei buy's cap rounds down to 0
 
         _order(4, euro, t, false, 1 ether, 0, 10 minutes, invalid);
     }
@@ -197,19 +197,81 @@ contract PositionRouterTest is Test {
         _sell(2, past35, _terms(past35), abi.encodeWithSelector(IPositionRouter.MarketNotAllowed.selector));
     }
 
-    /// @notice An order must end at least EXPIRY_BUFFER before its market expires, so an expired
-    ///         market can't be ordered at all.
-    function testFork_CreateOrder_EndsBeforeExpiry() public {
+    /// @notice An order may end up to EXPIRY_BUFFER (2 hours) after its market expires, and a market
+    ///         that expired longer ago than that can't be ordered at all.
+    function testFork_CreateOrder_EndsWithinBufferAfterExpiry() public {
         (IOption euro,) = _newOption(3_000e18, true); // expires in 1 day
         Terms memory t = _terms(euro);
-        uint32 latest = uint32(1 days - router.EXPIRY_BUFFER());
+        uint32 latest = uint32(1 days + router.EXPIRY_BUFFER());
         bytes memory outlives = abi.encodeWithSelector(IPositionRouter.OrderOutlivesMarket.selector);
 
         _order(1, euro, t, false, 1 ether, 100e6, latest, "");
         _order(2, euro, t, false, 1 ether, 100e6, latest + 1, outlives);
 
         vm.warp(t.expirationDate + 1);
-        _order(3, euro, t, false, 1 ether, 100e6, 0, outlives);
+        _order(3, euro, t, false, 1 ether, 100e6, uint32(router.EXPIRY_BUFFER() - 1), "");
+
+        vm.warp(t.expirationDate + router.EXPIRY_BUFFER() + 1);
+        _order(4, euro, t, false, 1 ether, 100e6, 0, outlives);
+    }
+
+    /// @notice A sell's price may not go below intrinsic value at spot ($3,000).
+    function testFork_CreateOrder_SellFloorIsIntrinsic() public {
+        bytes memory outOfBounds = abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector);
+        (IOption itmCall,) = _newOption(2_500e18, true); // $500 in the money
+        Terms memory t = _terms(itmCall);
+        _order(1, itmCall, t, false, 1 ether, 500e6, 10 minutes, "");
+        _order(2, itmCall, t, false, 1 ether, 500e6 - 1, 10 minutes, outOfBounds);
+
+        // One put is on 1 USDC of collateral, i.e. 1/3,500 ETH: worth $500 / 3,500 in the money.
+        IOption itmPut = _newPut(3_500e18);
+        t = _terms(itmPut);
+        uint256 intrinsic = uint256(500e6) * 1e6 / 3_500e6;
+        _order(3, itmPut, t, false, 1e6, intrinsic, 10 minutes, "");
+        _order(4, itmPut, t, false, 1e6, intrinsic - 1, 10 minutes, outOfBounds);
+
+        // Out of the money, the floor is 0.
+        (IOption otmCall,) = _newOption(3_500e18, true);
+        (uint256 floor,) = router.priceBounds(otmCall);
+        assertEq(floor, 0, "OTM call floor");
+    }
+
+    /// @notice A buy-back may pay at most intrinsic plus MAX_TIME_VALUE_BPS * sqrt(years) of spot:
+    ///         about $62.81 for a 1-day at-the-money call at $3,000.
+    function testFork_CreateOrder_BuyCapIsIntrinsicPlusTimeValue() public {
+        bytes memory outOfBounds = abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector);
+        (IOption atm,) = _newOption(3_000e18, true);
+        (uint256 floor, uint256 cap) = router.priceBounds(atm);
+        assertEq(floor, 0, "ATM floor");
+        assertApproxEqAbs(cap, 62.81e6, 0.01e6, "1-day ATM cap");
+        Terms memory t = _terms(atm);
+        _order(1, atm, t, true, 1 ether, cap, 10 minutes, "");
+        _order(2, atm, t, true, 1 ether, cap + 1, 10 minutes, outOfBounds);
+
+        // $500 in the money: the cap rises by the intrinsic value and by the time value on its spot.
+        (IOption itm,) = _newOption(2_500e18, true);
+        (floor, cap) = router.priceBounds(itm);
+        assertEq(floor, 500e6, "ITM floor");
+        assertApproxEqAbs(cap, 562.81e6, 0.01e6, "1-day ITM cap");
+    }
+
+    /// @notice From expiry the time value is gone, so a buy-back pays at most intrinsic, and once the
+    ///         exercise window closes the option is worth nothing and no buy-back can be priced.
+    function testFork_CreateOrder_BuyCapAfterExpiry() public {
+        (IOption itm,) = _newOption(2_500e18, true);
+        Terms memory t = _terms(itm);
+
+        vm.warp(t.expirationDate);
+        (uint256 floor, uint256 cap) = router.priceBounds(itm);
+        assertEq(cap, floor, "no time value at expiry");
+        assertEq(cap, 500e6, "intrinsic in the window");
+        _order(1, itm, t, true, 1 ether, 500e6, 10 minutes, "");
+        _order(2, itm, t, true, 1 ether, 500e6 + 1, 10 minutes, abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
+
+        vm.warp(t.expirationDate + t.windowSeconds + 1);
+        (floor, cap) = router.priceBounds(itm);
+        assertEq(floor + cap, 0, "worthless after the window");
+        _order(3, itm, t, true, 1 ether, 1, 10 minutes, abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
     }
 
     /// @notice With spot at $3,000, a call's strike must sit in [$1,500, $4,500].
@@ -220,7 +282,7 @@ contract PositionRouterTest is Test {
         (IOption tooLow,) = _newOption(1_499e18, true);
         (IOption tooHigh,) = _newOption(4_501e18, true);
 
-        _sell(1, low, _terms(low), "");
+        _order(1, low, _terms(low), false, 1 ether, 1_500e6, 10 minutes, ""); // at its $1,500 intrinsic
         _sell(2, high, _terms(high), "");
         _sell(3, tooLow, _terms(tooLow), outOfRange);
         _sell(4, tooHigh, _terms(tooHigh), outOfRange);

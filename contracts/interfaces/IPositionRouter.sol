@@ -24,10 +24,13 @@ interface IPositionRouter {
     error MarketNotAllowed();
     /// @notice Zero amount or total premium, or the nonce already holds an open order.
     error InvalidOrder();
-    /// @notice The order's deadline falls within `EXPIRY_BUFFER` of its market's expiry.
+    /// @notice The order's deadline falls more than `EXPIRY_BUFFER` after its market's expiry.
     error OrderOutlivesMarket();
     /// @notice The market's strike is more than `STRIKE_BAND_BPS` from the oracle's spot price.
     error StrikeOutOfRange();
+    /// @notice A sell's price is below the option's intrinsic value at spot, or a buy's is above
+    ///         intrinsic plus `MAX_TIME_VALUE_BPS` time value. See `priceBounds`.
+    error PriceOutOfBounds();
     /// @notice The oracle's answer is non-positive or older than `ORACLE_MAX_AGE`.
     error StalePrice();
     /// @notice No open order at this account and nonce.
