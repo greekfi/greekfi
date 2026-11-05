@@ -218,6 +218,40 @@ contract PositionRouterBebopTest is Test {
         assertEq(option.receipt().balanceOf(SAFE), 0, "position closed");
     }
 
+    /// @notice A resting sell at 100 USDC per option can't fill at that price once spot reaches $3,200
+    ///         and the $3,000 call is worth $200 in the money; a quote that covers intrinsic still fills.
+    function testFork_SellBlockedBelowIntrinsicAtFill() public {
+        _createOrder(NONCE, PREMIUM, 1 days);
+        feed.set(3_200e8);
+
+        _submitExpectingRevert(NONCE, _quote(PREMIUM), abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
+        _submitExpectingRevert(NONCE, _quote(2_000e6 - 1), abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
+        _submit(NONCE, _quote(2_000e6));
+    }
+
+    /// @notice A buy-back's cap is re-read at fill: after spot drops to $1,700 the 7-day $3,000 call's
+    ///         cap is about $94.17 per option, so a 100-per-option quote no longer fits but 90 does.
+    function testFork_BuyBackCappedAtFill() public {
+        _sellThenReadyBuyBack(true);
+        _createBuyOrder(2, PREMIUM);
+        feed.set(1_700e8);
+        (, uint256 cap) = router.priceBounds(option);
+        assertApproxEqAbs(cap, 94.17e6, 0.01e6, "7-day cap at $1,700");
+
+        _submitExpectingRevert(2, _buyQuote(PREMIUM), abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
+        _submit(2, _buyQuote(900e6));
+        assertEq(option.receipt().balanceOf(SAFE), 0, "position closed");
+    }
+
+    /// @notice The fill-time cap reads the oracle, so a buy-back now needs a fresh answer.
+    function testFork_BuyBackNeedsFreshOracle() public {
+        _sellThenReadyBuyBack(true);
+        _createBuyOrder(2, PREMIUM);
+        feed.setAge(router.ORACLE_MAX_AGE() + 1);
+
+        _submitExpectingRevert(2, _buyQuote(PREMIUM), abi.encodeWithSelector(IPositionRouter.StalePrice.selector));
+    }
+
     function testFork_BuyAboveLimitReverts() public {
         _sellThenReadyBuyBack(true);
         _createBuyOrder(2, PREMIUM);

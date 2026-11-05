@@ -34,9 +34,9 @@ import { IPositionRouter } from "../interfaces/IPositionRouter.sol";
  *
  *         Every order's strike must sit within {STRIKE_BAND_BPS} of the {ORACLE} spot price, checked
  *         when the order is created and again when a sell fills. Every order's price is checked
- *         against the option's value at spot when the order is created: a sell may not go below
- *         intrinsic value, and a buy-back may not pay more than intrinsic plus {MAX_TIME_VALUE_BPS}
- *         of time value (see {priceBounds}).
+ *         against the option's value at spot, when the order is created and again at fill: a sell
+ *         may not go below intrinsic value, and a buy-back may not pay more than intrinsic plus
+ *         {MAX_TIME_VALUE_BPS} of time value (see {priceBounds}).
  *
  *         Setup: approve collateral to the factory (the approval caps what all orders can write) and
  *         USDC to the router (it caps what buys can spend), then
@@ -112,7 +112,7 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     ///         {EXPIRY_BUFFER} before the order's deadline, and have its strike within
     ///         {STRIKE_BAND_BPS} of spot. `price` must sit within {priceBounds} at spot now: at least
     ///         intrinsic value for a sell, at most intrinsic plus {MAX_TIME_VALUE_BPS} time value for a
-    ///         buy. Neither bound is checked again at fill.
+    ///         buy. {submitOrder} checks the fill's own price against the same bounds at fill time.
     ///
     ///         `strike` through `windowSeconds` restate `option`'s terms and must match them exactly.
     ///         They are in the calldata so the Roles Modifier can pin or bound them; the router
@@ -202,14 +202,16 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     /// @dev Mints the options from `account` into the router and sells them; the USDC goes straight
     ///      to `account` and is measured there, so any fee counts against the premium. Re-checks the
     ///      strike band, since spot may have moved while the order rested. Buy-backs skip it, so a
-    ///      position that has moved far from spot can still be closed.
+    ///      position that has moved far from spot can still be closed. The premium received must
+    ///      also cover intrinsic value at today's spot.
     function _sell(
         address account,
         Order memory order,
         IBebopSettlement.SingleOrder calldata quote,
         IBebopSettlement.MakerSignature calldata makerSignature
     ) private returns (uint256 premium) {
-        _checkStrike(order.option.strike(), order.option.isPut(), _spot());
+        uint256 spot = _spot();
+        _checkStrike(order.option.strike(), order.option.isPut(), spot);
 
         // Read after the mint: a put's collateral is USDC too, and must not count against the premium.
         order.option.transferFrom(account, address(this), order.amount);
@@ -219,11 +221,16 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
 
         premium = IERC20(USDC).balanceOf(account) - usdcBefore;
         if (premium < order.premium) revert PremiumTooLow();
+        (uint256 minSellPrice,) = _boundsOf(order.option, spot);
+        if (premium < Math.mulDiv(order.amount, minSellPrice, 10 ** order.option.decimals(), Math.Rounding.Ceil)) {
+            revert PriceOutOfBounds();
+        }
     }
 
     /// @dev Pulls the quoted USDC from `account`, buys the options into the router and sends them on.
     ///      With `Perm.BURN` from `account`, that send pair-burns them against its Receipts and the
-    ///      collateral returns to `account` in the same call.
+    ///      collateral returns to `account` in the same call. The premium paid may not exceed
+    ///      {priceBounds}' cap at today's spot, so this needs a fresh {ORACLE} answer too.
     function _buy(
         address account,
         Order memory order,
@@ -232,6 +239,8 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     ) private returns (uint256 premium) {
         premium = quote.taker_amount;
         if (premium > order.premium) revert PremiumTooHigh();
+        (, uint256 maxBuyPrice) = _boundsOf(order.option, _spot());
+        if (premium > Math.mulDiv(order.amount, maxBuyPrice, 10 ** order.option.decimals())) revert PriceOutOfBounds();
         IERC20(USDC).safeTransferFrom(account, address(this), premium);
         IERC20(USDC).forceApprove(address(BEBOP), premium);
 
@@ -247,9 +256,14 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     ///         spot), a buy's at most `maxBuyPrice` (intrinsic plus {MAX_TIME_VALUE_BPS} time value).
     ///         Both are 0 once the exercise window has closed.
     function priceBounds(IOption option) external view returns (uint256 minSellPrice, uint256 maxBuyPrice) {
-        IReceipt receipt = _receiptOf(option);
-        uint40 expirationDate = receipt.expirationDate();
-        return _priceBounds(receipt.strike(), receipt.isPut(), expirationDate, uint40(receipt.exerciseDeadline() - expirationDate), _spot());
+        _receiptOf(option);
+        return _boundsOf(option, _spot());
+    }
+
+    /// @dev {_priceBounds} for a market already known to be the factory's.
+    function _boundsOf(IOption option, uint256 spot) private view returns (uint256, uint256) {
+        uint40 expirationDate = option.expirationDate();
+        return _priceBounds(option.strike(), option.isPut(), expirationDate, uint40(option.exerciseDeadline() - expirationDate), spot);
     }
 
     /// @dev Values one whole option at `spot` in USDC base units. A call is on 1 WETH. A put is on
