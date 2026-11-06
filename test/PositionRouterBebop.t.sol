@@ -10,6 +10,7 @@ import { IBebopSettlement } from "../contracts/interfaces/IBebopSettlement.sol";
 import { ISafe } from "../contracts/interfaces/ISafe.sol";
 import { IPositionRouter } from "../contracts/interfaces/IPositionRouter.sol";
 import { PositionRouter } from "../contracts/periphery/PositionRouter.sol";
+import { MockPriceFeed } from "./MockPriceFeed.sol";
 
 /// @notice Mainnet-fork proof that the ENS Endowment Safe can post a limit order through its Roles
 ///         Modifier, and that anyone can later fill it with a fresh Bebop quote: the option mints just
@@ -36,6 +37,8 @@ contract PositionRouterBebopTest is Test {
     uint256 constant NONCE = 1;
 
     PositionRouter router;
+    /// @dev Spot pinned at $3,000.
+    MockPriceFeed feed;
     IOption option;
     address maker;
     address keeper = makeAddr("keeper");
@@ -43,7 +46,8 @@ contract PositionRouterBebopTest is Test {
     function setUp() public {
         vm.createSelectFork(vm.envOr("ETH_RPC_URL", string("https://ethereum-rpc.publicnode.com")));
 
-        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC));
+        feed = new MockPriceFeed();
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC), feed);
         option = IOption(
             FACTORY.createOption(
                 CreateParams({
@@ -146,6 +150,15 @@ contract PositionRouterBebopTest is Test {
         _submitExpectingRevert(NONCE, _quote(PREMIUM), abi.encodeWithSelector(IPositionRouter.UnknownOrder.selector));
     }
 
+    /// @notice A sell order may run past expiry (up to EXPIRY_BUFFER), but never fills from expiry on.
+    function testFork_SellRefusedFromExpiry() public {
+        uint40 expiry = option.expirationDate();
+        _createOrder(NONCE, PREMIUM, uint32(expiry - block.timestamp + 1 hours));
+        vm.warp(expiry);
+
+        _submitExpectingRevert(NONCE, _quote(PREMIUM), abi.encodeWithSelector(IPositionRouter.MarketExpired.selector));
+    }
+
     function testFork_ExpiredOrderCannotFill() public {
         _createOrder(NONCE, PREMIUM, 1 hours);
         vm.warp(block.timestamp + 1 hours + 1);
@@ -192,6 +205,71 @@ contract PositionRouterBebopTest is Test {
 
         assertEq(option.balanceOf(SAFE), AMOUNT, "options returned");
         assertEq(option.receipt().balanceOf(SAFE), AMOUNT, "receipts kept");
+    }
+
+    /// @notice A resting sell re-checks the strike band at fill: once spot runs to $7,000, the $3,000
+    ///         call is deep in the money and the order can no longer fill.
+    function testFork_SellBlockedWhenSpotLeavesBand() public {
+        _createOrder(NONCE, PREMIUM, 1 days);
+        feed.set(7_000e8);
+
+        _submitExpectingRevert(NONCE, _quote(PREMIUM), abi.encodeWithSelector(IPositionRouter.StrikeOutOfRange.selector));
+    }
+
+    /// @notice A buy-back skips the fill-time band, so a position that moved far from spot can still close.
+    /// @notice A buy-back can also be created after spot has left the band: spot at $7,000 puts the
+    ///         $3,000 call's strike out of band, but the close still posts and fills.
+    function testFork_BuyBackCreatedAfterSpotLeavesBand() public {
+        _sellThenReadyBuyBack(true);
+        feed.set(7_000e8);
+        _createBuyOrder(2, PREMIUM);
+
+        _submit(2, _buyQuote(PREMIUM));
+        assertEq(option.receipt().balanceOf(SAFE), 0, "position closed");
+    }
+
+    function testFork_BuyBackFillsWhenSpotLeavesBand() public {
+        _sellThenReadyBuyBack(true);
+        _createBuyOrder(2, PREMIUM);
+        feed.set(7_000e8);
+
+        _submit(2, _buyQuote(PREMIUM));
+
+        assertEq(option.receipt().balanceOf(SAFE), 0, "position closed");
+    }
+
+    /// @notice A resting sell at 100 USDC per option can't fill at that price once spot reaches $3,200
+    ///         and the $3,000 call is worth $200 in the money; a quote that covers intrinsic still fills.
+    function testFork_SellBlockedBelowIntrinsicAtFill() public {
+        _createOrder(NONCE, PREMIUM, 1 days);
+        feed.set(3_200e8);
+
+        _submitExpectingRevert(NONCE, _quote(PREMIUM), abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
+        _submitExpectingRevert(NONCE, _quote(2_000e6 - 1), abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
+        _submit(NONCE, _quote(2_000e6));
+    }
+
+    /// @notice A buy-back's cap is re-read at fill: after spot drops to $2,600 the 7-day $3,000 call's
+    ///         cap is about $80.13 per option, so a 100-per-option quote no longer fits but 75 does.
+    function testFork_BuyBackCappedAtFill() public {
+        _sellThenReadyBuyBack(true);
+        _createBuyOrder(2, PREMIUM);
+        feed.set(2_600e8);
+        (, uint256 cap) = router.priceBounds(option);
+        assertApproxEqAbs(cap, 80.13e6, 0.01e6, "7-day cap at $2,600");
+
+        _submitExpectingRevert(2, _buyQuote(PREMIUM), abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
+        _submit(2, _buyQuote(750e6));
+        assertEq(option.receipt().balanceOf(SAFE), 0, "position closed");
+    }
+
+    /// @notice The fill-time cap reads the oracle, so a buy-back now needs a fresh answer.
+    function testFork_BuyBackNeedsFreshOracle() public {
+        _sellThenReadyBuyBack(true);
+        _createBuyOrder(2, PREMIUM);
+        feed.setAge(router.ORACLE_MAX_AGE() + 1);
+
+        _submitExpectingRevert(2, _buyQuote(PREMIUM), abi.encodeWithSelector(IPositionRouter.StalePrice.selector));
     }
 
     function testFork_BuyAboveLimitReverts() public {
@@ -241,7 +319,7 @@ contract PositionRouterBebopTest is Test {
         vm.stopPrank();
         uint256 usdcBefore = USDC.balanceOf(SAFE);
 
-        assertTrue(_fromRoles(abi.encodeCall(router.createOrder, (1, put, false, size, PREMIUM, 1 days))), "create sell");
+        assertTrue(_fromRoles(_orderCall(1, put, false, size, PREMIUM, 1 days)), "create sell");
         IBebopSettlement.SingleOrder memory sell = _quote(PREMIUM);
         (sell.taker_token, sell.taker_amount) = (address(put), size);
         _submit(1, sell);
@@ -250,23 +328,53 @@ contract PositionRouterBebopTest is Test {
         assertEq(put.receipt().balanceOf(SAFE), size, "safe holds the receipts");
         assertEq(usdcBefore - USDC.balanceOf(SAFE), size - PREMIUM, "collateral locked, premium received");
 
-        assertTrue(_fromRoles(abi.encodeCall(router.createOrder, (2, put, true, size, PREMIUM, 1 days))), "create buy");
+        // Buy back at 100 USDC: the tent caps this 47%-out-of-the-money put at about $103 for the lot.
+        uint256 buyBack = 100e6;
+        assertTrue(!_fromRoles(_orderCall(3, put, true, size, PREMIUM, 1 days)), "tent refuses 1,000 USDC");
+        assertTrue(_fromRoles(_orderCall(2, put, true, size, buyBack, 1 days)), "create buy");
         vm.prank(maker);
         put.approve(BEBOP, size);
-        IBebopSettlement.SingleOrder memory buy = _buyQuote(PREMIUM);
+        IBebopSettlement.SingleOrder memory buy = _buyQuote(buyBack);
         (buy.maker_token, buy.maker_amount) = (address(put), size);
         _submit(2, buy);
 
         assertEq(put.receipt().balanceOf(SAFE), 0, "receipts burned");
-        assertEq(USDC.balanceOf(SAFE), usdcBefore, "collateral back, premium paid back");
+        assertEq(USDC.balanceOf(SAFE), usdcBefore + PREMIUM - buyBack, "collateral back, net premium kept");
     }
 
     function _createOrder(uint256 nonce, uint256 minPremium, uint32 duration) internal {
-        assertTrue(_fromRoles(abi.encodeCall(router.createOrder, (nonce, option, false, AMOUNT, minPremium, duration))), "create");
+        assertTrue(_fromRoles(_orderCall(nonce, option, false, AMOUNT, minPremium, duration)), "create");
     }
 
     function _createBuyOrder(uint256 nonce, uint256 maxPremium) internal {
-        assertTrue(_fromRoles(abi.encodeCall(router.createOrder, (nonce, option, true, AMOUNT, maxPremium, 1 days))), "create buy");
+        assertTrue(_fromRoles(_orderCall(nonce, option, true, AMOUNT, maxPremium, 1 days)), "create buy");
+    }
+
+    /// @dev `createOrder` calldata restating `market`'s own terms, as a Roles preset would see it.
+    ///      Takes the order's total `premium` and passes the per-option price it implies.
+    function _orderCall(uint256 nonce, IOption market, bool isBuy, uint256 amount, uint256 premium, uint32 duration)
+        internal
+        view
+        returns (bytes memory)
+    {
+        uint40 expiry = market.expirationDate();
+        uint256 price = premium * 10 ** market.decimals() / amount;
+        return abi.encodeCall(
+            router.createOrder,
+            (
+                nonce,
+                market,
+                market.strike(),
+                expiry,
+                market.isPut(),
+                market.isEuro(),
+                uint40(market.exerciseDeadline() - expiry),
+                isBuy,
+                amount,
+                price,
+                duration
+            )
+        );
     }
 
     /// @dev The maker sells the options back: it pays them, the router pays USDC.
