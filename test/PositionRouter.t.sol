@@ -260,17 +260,20 @@ contract PositionRouterTest is Test {
         assertApproxEqAbs(cap, 8.07e6, 0.01e6, "the tent tapers away from the strike");
     }
 
-    /// @notice At expiry the tent keeps its TENT_PEAK base: the $2,500 call's cap is $515 intrinsic
-    ///         (spot +0.5%) plus $13.92. Once the exercise window closes the option is worth nothing
-    ///         and no buy-back can be priced.
+    /// @notice From expiry the tent gives way to a flat POST_EXPIRY_BUFFER_BPS (0.5%) of spot: the
+    ///         $2,500 call's cap is $515 intrinsic (spot +0.5%) plus $15, and an out-of-the-money
+    ///         call's is the $15 alone. Once the exercise window closes no buy-back can be priced.
     function testFork_CreateOrder_BuyCapAfterExpiry() public {
         (IOption itm,) = _newOption(2_500e18, true);
+        (IOption otm,) = _newOption(3_300e18, true);
         Terms memory t = _terms(itm);
 
         vm.warp(t.expirationDate);
         (uint256 floor, uint256 cap) = router.priceBounds(itm);
         assertEq(floor, 500e6, "intrinsic in the window");
-        assertApproxEqAbs(cap, 528.92e6, 0.01e6, "intrinsic + 0.5% + the tent at T = 0");
+        assertEq(cap, 530e6, "intrinsic at spot +0.5%, plus 0.5% of spot");
+        (, uint256 otmCap) = router.priceBounds(otm);
+        assertEq(otmCap, 15e6, "out of the money: the buffer alone");
         _order(1, itm, t, true, 1 ether, cap, 10 minutes, "");
         _order(2, itm, t, true, 1 ether, cap + 1, 10 minutes, abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
 
@@ -281,6 +284,17 @@ contract PositionRouterTest is Test {
     }
 
     /// @notice With spot at $3,000, a call's strike must sit in [$1,500, $4,500].
+    /// @notice The band applies to sells only: a buy-back on a strike far from spot can still be
+    ///         posted, so a position spot has run away from can be closed.
+    function testFork_CreateOrder_BuyBackSkipsBand() public {
+        (IOption farCall,) = _newOption(1_400e18, true); // $1,600 in the money at $3,000
+        Terms memory t = _terms(farCall);
+        (, uint256 cap) = router.priceBounds(farCall);
+
+        _order(1, farCall, t, false, 1 ether, 1_600e6, 10 minutes, abi.encodeWithSelector(IPositionRouter.StrikeOutOfRange.selector));
+        _order(2, farCall, t, true, 1 ether, cap, 10 minutes, "");
+    }
+
     function testFork_CreateOrder_CallStrikeWithinBand() public {
         bytes memory outOfRange = abi.encodeWithSelector(IPositionRouter.StrikeOutOfRange.selector);
         (IOption low,) = _newOption(1_500e18, true);

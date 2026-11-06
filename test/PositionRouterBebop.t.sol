@@ -150,6 +150,15 @@ contract PositionRouterBebopTest is Test {
         _submitExpectingRevert(NONCE, _quote(PREMIUM), abi.encodeWithSelector(IPositionRouter.UnknownOrder.selector));
     }
 
+    /// @notice A sell order may run past expiry (up to EXPIRY_BUFFER), but never fills from expiry on.
+    function testFork_SellRefusedFromExpiry() public {
+        uint40 expiry = option.expirationDate();
+        _createOrder(NONCE, PREMIUM, uint32(expiry - block.timestamp + 1 hours));
+        vm.warp(expiry);
+
+        _submitExpectingRevert(NONCE, _quote(PREMIUM), abi.encodeWithSelector(IPositionRouter.MarketExpired.selector));
+    }
+
     function testFork_ExpiredOrderCannotFill() public {
         _createOrder(NONCE, PREMIUM, 1 hours);
         vm.warp(block.timestamp + 1 hours + 1);
@@ -208,6 +217,17 @@ contract PositionRouterBebopTest is Test {
     }
 
     /// @notice A buy-back skips the fill-time band, so a position that moved far from spot can still close.
+    /// @notice A buy-back can also be created after spot has left the band: spot at $7,000 puts the
+    ///         $3,000 call's strike out of band, but the close still posts and fills.
+    function testFork_BuyBackCreatedAfterSpotLeavesBand() public {
+        _sellThenReadyBuyBack(true);
+        feed.set(7_000e8);
+        _createBuyOrder(2, PREMIUM);
+
+        _submit(2, _buyQuote(PREMIUM));
+        assertEq(option.receipt().balanceOf(SAFE), 0, "position closed");
+    }
+
     function testFork_BuyBackFillsWhenSpotLeavesBand() public {
         _sellThenReadyBuyBack(true);
         _createBuyOrder(2, PREMIUM);

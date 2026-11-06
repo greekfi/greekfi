@@ -66,9 +66,8 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     uint256 public constant MAX_TENOR = 35 days;
     /// @notice Longest post-expiry exercise window an order's market may have.
     uint256 public constant MAX_WINDOW = 1 hours;
-    /// @notice An order's deadline may fall at most this long after its market expires. Sells stop
-    ///         filling at expiry anyway, since the Option refuses to mint from then on; buy-backs
-    ///         (pair-burns) can still fill until the deadline.
+    /// @notice An order's deadline may fall at most this long after its market expires. Only
+    ///         buy-backs use that time: a sell never fills at or after expiry (`MarketExpired`).
     uint256 public constant EXPIRY_BUFFER = 2 hours;
     /// @notice Widest an order's strike may sit from spot, in basis points of spot (50%).
     uint256 public constant STRIKE_BAND_BPS = 5_000;
@@ -91,6 +90,10 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     ///         so a lagging {ORACLE} cannot block a fair buy-back of an in-the-money option. The
     ///         ETH / USD feed updates on a 0.5% deviation.
     uint256 public constant ORACLE_TOLERANCE_BPS = 50;
+    /// @notice From expiry to the exercise deadline an option is worth its intrinsic value, so the
+    ///         buy cap swaps the tent for this flat allowance, in basis points of spot, on top of the
+    ///         {ORACLE_TOLERANCE_BPS}-adjusted intrinsic.
+    uint256 public constant POST_EXPIRY_BUFFER_BPS = 50;
 
     /// @notice Open limit orders by account and account-chosen nonce.
     mapping(address account => mapping(uint256 nonce => Order)) public orders;
@@ -121,8 +124,9 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     ///         with `isBuy` to buy `amount` back for at most `price` per option, until `duration`
     ///         seconds from now. The market must be European, pair {WETH} with {USDC} (a put exactly
     ///         when USDC is the collateral), fit {MAX_TENOR} and {MAX_WINDOW}, expire no more than
-    ///         {EXPIRY_BUFFER} before the order's deadline, and have its strike within
-    ///         {STRIKE_BAND_BPS} of spot. `price` must sit within {priceBounds} at spot now: at least
+    ///         {EXPIRY_BUFFER} before the order's deadline, and, for a sell, have its strike within
+    ///         {STRIKE_BAND_BPS} of spot (a buy-back skips the band, so a position spot has run away
+    ///         from can still be closed). `price` must sit within {priceBounds} at spot now: at least
     ///         intrinsic value for a sell, at most intrinsic plus the time-value tent for a buy.
     ///         {submitOrder} checks the fill's own price against the same bounds at fill time.
     ///
@@ -168,7 +172,7 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
         if (deadline > uint256(expirationDate) + EXPIRY_BUFFER) revert OrderOutlivesMarket();
 
         uint256 spot = _spot();
-        _checkStrike(strike, isPut, spot);
+        if (!isBuy) _checkStrike(strike, isPut, spot);
         (uint256 minSellPrice, uint256 maxBuyPrice) = _priceBounds(strike, isPut, expirationDate, windowSeconds, spot);
         if (isBuy ? price > maxBuyPrice : price < minSellPrice) revert PriceOutOfBounds();
 
@@ -212,16 +216,21 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     }
 
     /// @dev Mints the options from `account` into the router and sells them; the USDC goes straight
-    ///      to `account` and is measured there, so any fee counts against the premium. Re-checks the
-    ///      strike band, since spot may have moved while the order rested. Buy-backs skip it, so a
-    ///      position that has moved far from spot can still be closed. The premium received must
-    ///      also cover intrinsic value at today's spot.
+    ///      to `account` and is measured there, so any fee counts against the premium. Refuses to
+    ///      fill at or after expiry: options the account already holds would transfer without a
+    ///      mint, and are worth more pair-burned against its Receipts. Re-checks the strike band,
+    ///      since spot may have moved while the order rested. Buy-backs skip it, so a position that
+    ///      has moved far from spot can still be closed. The premium received must also cover
+    ///      intrinsic value at today's spot.
     function _sell(
         address account,
         Order memory order,
         IBebopSettlement.SingleOrder calldata quote,
         IBebopSettlement.MakerSignature calldata makerSignature
     ) private returns (uint256 premium) {
+        if (block.timestamp >= order.option.expirationDate()) {
+            revert MarketExpired();
+        }
         uint256 spot = _spot();
         _checkStrike(order.option.strike(), order.option.isPut(), spot);
 
@@ -283,7 +292,8 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     ///      1 USDC of collateral, exercised by paying `1 / humanStrike` WETH, so its value per ETH of
     ///      underlying is divided by `humanStrike`. The sell floor is intrinsic value at `spot`. The
     ///      buy cap is intrinsic at spot moved {ORACLE_TOLERANCE_BPS} in the option's favour, plus
-    ///      `spot` times the {_tent}. After the exercise window the option is worth nothing.
+    ///      `spot` times the {_tent}; from expiry, {POST_EXPIRY_BUFFER_BPS} of spot instead. After the
+    ///      exercise window the option is worth nothing.
     function _priceBounds(uint256 strike, bool isPut, uint40 expirationDate, uint40 windowSeconds, uint256 spot)
         private
         view
@@ -296,7 +306,9 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
         intrinsic = Math.mulDiv(_itm(spot, humanStrike, isPut), USDC_UNIT, per);
 
         uint256 favoured = isPut ? spot * (10_000 - ORACLE_TOLERANCE_BPS) / 10_000 : spot * (10_000 + ORACLE_TOLERANCE_BPS) / 10_000;
-        uint256 timeValue = Math.mulDiv(spot, _tent(humanStrike, spot, expirationDate), 1e18);
+        uint256 timeValue = block.timestamp < expirationDate
+            ? Math.mulDiv(spot, _tent(humanStrike, spot, expirationDate), 1e18)
+            : spot * POST_EXPIRY_BUFFER_BPS / 10_000;
         cap = Math.mulDiv(_itm(favoured, humanStrike, isPut) + timeValue, USDC_UNIT, per);
     }
 
