@@ -35,8 +35,8 @@ import { IPositionRouter } from "../interfaces/IPositionRouter.sol";
  *         Every order's strike must sit within {STRIKE_BAND_BPS} of the {ORACLE} spot price, checked
  *         when the order is created and again when a sell fills. Every order's price is checked
  *         against the option's value at spot, when the order is created and again at fill: a sell
- *         may not go below intrinsic value, and a buy-back may not pay more than intrinsic plus
- *         {MAX_TIME_VALUE_BPS} of time value (see {priceBounds}).
+ *         may not go below intrinsic value, and a buy-back may not pay more than intrinsic plus the
+ *         time-value "tent" (see {priceBounds}).
  *
  *         Setup: approve collateral to the factory (the approval caps what all orders can write) and
  *         USDC to the router (it caps what buys can spend), then
@@ -74,11 +74,23 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     uint256 public constant STRIKE_BAND_BPS = 5_000;
     /// @notice Oldest {ORACLE} answer the router accepts. The ETH / USD feed's heartbeat is 1 hour.
     uint256 public constant ORACLE_MAX_AGE = 2 hours;
-    /// @notice Most time value a buy-back may pay on top of intrinsic value, in basis points of the
-    ///         underlying's value per square root of a year. An at-the-money option is worth about
-    ///         `0.4 * vol * sqrt(t)` of its underlying, so 4,000 is an at-the-money option at 100%
-    ///         vol: 12.4% of spot at 35 days, 2.1% at 1 day, nothing from expiry on.
-    uint256 public constant MAX_TIME_VALUE_BPS = 4_000;
+    /// @notice The buy-back cap's time-value tent, as a share of spot (18 decimals), T in years and
+    ///         d = |K - S| / sqrt(K S):
+    ///
+    ///             tent = (TENT_PEAK + TENT_PEAK_SLOPE sqrt(T)) / (1 + d / (4 (TENT_WIDTH + TENT_WIDTH_SLOPE sqrt(T))))^4
+    ///
+    ///         Fitted so every Deribit ETH mark from Aug 2025 to Mar 2026 (14.9M, strikes within 50%
+    ///         of spot, up to 35 days) sits under it with at least 1.08x room, and every Derive and Rysk
+    ///         fill passes (greek research repo, `buyback-cap/`). 3.8% of spot at the strike at
+    ///         expiry, 5.4% at 1 day, 12.9% at 35 days; it falls off with distance from the strike.
+    uint256 public constant TENT_PEAK = 0.038e18;
+    uint256 public constant TENT_PEAK_SLOPE = 0.3e18;
+    uint256 public constant TENT_WIDTH = 0.066e18;
+    uint256 public constant TENT_WIDTH_SLOPE = 0.49e18;
+    /// @notice The buy-back cap prices intrinsic value at spot moved this far in the option's favour,
+    ///         so a lagging {ORACLE} cannot block a fair buy-back of an in-the-money option. The
+    ///         ETH / USD feed updates on a 0.5% deviation.
+    uint256 public constant ORACLE_TOLERANCE_BPS = 50;
 
     /// @notice Open limit orders by account and account-chosen nonce.
     mapping(address account => mapping(uint256 nonce => Order)) public orders;
@@ -111,8 +123,8 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     ///         when USDC is the collateral), fit {MAX_TENOR} and {MAX_WINDOW}, expire no more than
     ///         {EXPIRY_BUFFER} before the order's deadline, and have its strike within
     ///         {STRIKE_BAND_BPS} of spot. `price` must sit within {priceBounds} at spot now: at least
-    ///         intrinsic value for a sell, at most intrinsic plus {MAX_TIME_VALUE_BPS} time value for a
-    ///         buy. {submitOrder} checks the fill's own price against the same bounds at fill time.
+    ///         intrinsic value for a sell, at most intrinsic plus the time-value tent for a buy.
+    ///         {submitOrder} checks the fill's own price against the same bounds at fill time.
     ///
     ///         `strike` through `windowSeconds` restate `option`'s terms and must match them exactly.
     ///         They are in the calldata so the Roles Modifier can pin or bound them; the router
@@ -253,7 +265,8 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
 
     /// @notice The price range {createOrder} accepts for `option` right now, in USDC base units per
     ///         whole option: a sell's `price` must be at least `minSellPrice` (intrinsic value at
-    ///         spot), a buy's at most `maxBuyPrice` (intrinsic plus {MAX_TIME_VALUE_BPS} time value).
+    ///         spot), a buy's at most `maxBuyPrice` (intrinsic, with {ORACLE_TOLERANCE_BPS}, plus the
+    ///         {TENT_PEAK} time-value tent).
     ///         Both are 0 once the exercise window has closed.
     function priceBounds(IOption option) external view returns (uint256 minSellPrice, uint256 maxBuyPrice) {
         _receiptOf(option);
@@ -267,10 +280,10 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     }
 
     /// @dev Values one whole option at `spot` in USDC base units. A call is on 1 WETH. A put is on
-    ///      1 USDC of collateral, exercised by paying `1 / humanStrike` WETH, so its underlying is worth
-    ///      `spot / humanStrike` USDC. Intrinsic value is the in-the-money gap on that underlying; the
-    ///      time-value cap is {MAX_TIME_VALUE_BPS} of the underlying's value, scaled by the square root
-    ///      of the time left in years. After the exercise window the option is worth nothing.
+    ///      1 USDC of collateral, exercised by paying `1 / humanStrike` WETH, so its value per ETH of
+    ///      underlying is divided by `humanStrike`. The sell floor is intrinsic value at `spot`. The
+    ///      buy cap is intrinsic at spot moved {ORACLE_TOLERANCE_BPS} in the option's favour, plus
+    ///      `spot` times the {_tent}. After the exercise window the option is worth nothing.
     function _priceBounds(uint256 strike, bool isPut, uint40 expirationDate, uint40 windowSeconds, uint256 spot)
         private
         view
@@ -278,16 +291,33 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     {
         if (block.timestamp > uint256(expirationDate) + windowSeconds) return (0, 0);
         uint256 humanStrike = isPut ? 1e36 / strike : strike;
-        // A call is on 1 ETH; a put on `1 / humanStrike` ETH. Both 18 decimals, like spot and strike.
+        // USD per ETH of underlying (18 decimals) to USDC base units per option.
         uint256 per = isPut ? humanStrike : 1e18;
-        uint256 itm = isPut ? (humanStrike > spot ? humanStrike - spot : 0) : (spot > humanStrike ? spot - humanStrike : 0);
-        intrinsic = Math.mulDiv(itm, USDC_UNIT, per);
+        intrinsic = Math.mulDiv(_itm(spot, humanStrike, isPut), USDC_UNIT, per);
 
+        uint256 favoured = isPut ? spot * (10_000 - ORACLE_TOLERANCE_BPS) / 10_000 : spot * (10_000 + ORACLE_TOLERANCE_BPS) / 10_000;
+        uint256 timeValue = Math.mulDiv(spot, _tent(humanStrike, spot, expirationDate), 1e18);
+        cap = Math.mulDiv(_itm(favoured, humanStrike, isPut) + timeValue, USDC_UNIT, per);
+    }
+
+    /// @dev In-the-money amount per ETH of underlying, 18 decimals.
+    function _itm(uint256 spot, uint256 humanStrike, bool isPut) private pure returns (uint256) {
+        return isPut ? (humanStrike > spot ? humanStrike - spot : 0) : (spot > humanStrike ? spot - humanStrike : 0);
+    }
+
+    /// @dev Time value the buy cap allows, as a share of spot (18 decimals): the {TENT_PEAK} tent at
+    ///      `humanStrike`'s distance from `spot` and the time left to `expirationDate` (none after).
+    ///      `1 / (1 + d / 4w)` is computed as `4w / (4w + d)`.
+    function _tent(uint256 humanStrike, uint256 spot, uint40 expirationDate) private view returns (uint256) {
         uint256 timeLeft = block.timestamp < expirationDate ? expirationDate - block.timestamp : 0;
-        // sqrt(timeLeft / 1 year), 18 decimals.
-        uint256 sqrtYears = Math.sqrt(timeLeft * 1e36 / 365 days);
-        uint256 underlying = Math.mulDiv(spot, USDC_UNIT, per);
-        cap = intrinsic + Math.mulDiv(underlying, MAX_TIME_VALUE_BPS * sqrtYears, 10_000 * 1e18);
+        uint256 sqrtYears = Math.sqrt(timeLeft * 1e36 / 365 days); // 18 decimals
+        uint256 peak = TENT_PEAK + Math.mulDiv(TENT_PEAK_SLOPE, sqrtYears, 1e18);
+        uint256 width4 = 4 * (TENT_WIDTH + Math.mulDiv(TENT_WIDTH_SLOPE, sqrtYears, 1e18));
+        uint256 gap = humanStrike > spot ? humanStrike - spot : spot - humanStrike;
+        uint256 d = Math.mulDiv(gap, 1e18, Math.sqrt(humanStrike * spot));
+        uint256 q = Math.mulDiv(width4, 1e18, width4 + d);
+        q = q * q / 1e18;
+        return Math.mulDiv(peak, q * q, 1e36);
     }
 
     /// @dev The {ORACLE} spot as USD per ETH, 18 decimals. Reverts on a non-positive or stale answer.

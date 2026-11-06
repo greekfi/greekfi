@@ -236,37 +236,43 @@ contract PositionRouterTest is Test {
         assertEq(floor, 0, "OTM call floor");
     }
 
-    /// @notice A buy-back may pay at most intrinsic plus MAX_TIME_VALUE_BPS * sqrt(years) of spot:
-    ///         about $62.81 for a 1-day at-the-money call at $3,000.
-    function testFork_CreateOrder_BuyCapIsIntrinsicPlusTimeValue() public {
+    /// @notice A buy-back may pay at most intrinsic (at spot +0.5% for a call) plus spot times the
+    ///         tent. Expected values from the research formula, at $3,000 spot and 1 day: $176.11 at
+    ///         the strike, $546.99 for the $2,500 call ($515 intrinsic + $31.99), $8.07 at the $4,500
+    ///         band edge.
+    function testFork_CreateOrder_BuyCapIsTent() public {
         bytes memory outOfBounds = abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector);
         (IOption atm,) = _newOption(3_000e18, true);
         (uint256 floor, uint256 cap) = router.priceBounds(atm);
         assertEq(floor, 0, "ATM floor");
-        assertApproxEqAbs(cap, 62.81e6, 0.01e6, "1-day ATM cap");
+        assertApproxEqAbs(cap, 176.11e6, 0.01e6, "1-day cap at the strike");
         Terms memory t = _terms(atm);
         _order(1, atm, t, true, 1 ether, cap, 10 minutes, "");
         _order(2, atm, t, true, 1 ether, cap + 1, 10 minutes, outOfBounds);
 
-        // $500 in the money: the cap rises by the intrinsic value and by the time value on its spot.
         (IOption itm,) = _newOption(2_500e18, true);
         (floor, cap) = router.priceBounds(itm);
-        assertEq(floor, 500e6, "ITM floor");
-        assertApproxEqAbs(cap, 562.81e6, 0.01e6, "1-day ITM cap");
+        assertEq(floor, 500e6, "ITM floor: intrinsic at spot");
+        assertApproxEqAbs(cap, 546.99e6, 0.01e6, "1-day ITM cap");
+
+        (IOption edge,) = _newOption(4_500e18, true);
+        (, cap) = router.priceBounds(edge);
+        assertApproxEqAbs(cap, 8.07e6, 0.01e6, "the tent tapers away from the strike");
     }
 
-    /// @notice From expiry the time value is gone, so a buy-back pays at most intrinsic, and once the
-    ///         exercise window closes the option is worth nothing and no buy-back can be priced.
+    /// @notice At expiry the tent keeps its TENT_PEAK base: the $2,500 call's cap is $515 intrinsic
+    ///         (spot +0.5%) plus $13.92. Once the exercise window closes the option is worth nothing
+    ///         and no buy-back can be priced.
     function testFork_CreateOrder_BuyCapAfterExpiry() public {
         (IOption itm,) = _newOption(2_500e18, true);
         Terms memory t = _terms(itm);
 
         vm.warp(t.expirationDate);
         (uint256 floor, uint256 cap) = router.priceBounds(itm);
-        assertEq(cap, floor, "no time value at expiry");
-        assertEq(cap, 500e6, "intrinsic in the window");
-        _order(1, itm, t, true, 1 ether, 500e6, 10 minutes, "");
-        _order(2, itm, t, true, 1 ether, 500e6 + 1, 10 minutes, abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
+        assertEq(floor, 500e6, "intrinsic in the window");
+        assertApproxEqAbs(cap, 528.92e6, 0.01e6, "intrinsic + 0.5% + the tent at T = 0");
+        _order(1, itm, t, true, 1 ether, cap, 10 minutes, "");
+        _order(2, itm, t, true, 1 ether, cap + 1, 10 minutes, abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
 
         vm.warp(t.expirationDate + t.windowSeconds + 1);
         (floor, cap) = router.priceBounds(itm);

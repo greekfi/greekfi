@@ -229,17 +229,17 @@ contract PositionRouterBebopTest is Test {
         _submit(NONCE, _quote(2_000e6));
     }
 
-    /// @notice A buy-back's cap is re-read at fill: after spot drops to $1,700 the 7-day $3,000 call's
-    ///         cap is about $94.17 per option, so a 100-per-option quote no longer fits but 90 does.
+    /// @notice A buy-back's cap is re-read at fill: after spot drops to $2,600 the 7-day $3,000 call's
+    ///         cap is about $80.13 per option, so a 100-per-option quote no longer fits but 75 does.
     function testFork_BuyBackCappedAtFill() public {
         _sellThenReadyBuyBack(true);
         _createBuyOrder(2, PREMIUM);
-        feed.set(1_700e8);
+        feed.set(2_600e8);
         (, uint256 cap) = router.priceBounds(option);
-        assertApproxEqAbs(cap, 94.17e6, 0.01e6, "7-day cap at $1,700");
+        assertApproxEqAbs(cap, 80.13e6, 0.01e6, "7-day cap at $2,600");
 
         _submitExpectingRevert(2, _buyQuote(PREMIUM), abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
-        _submit(2, _buyQuote(900e6));
+        _submit(2, _buyQuote(750e6));
         assertEq(option.receipt().balanceOf(SAFE), 0, "position closed");
     }
 
@@ -308,15 +308,18 @@ contract PositionRouterBebopTest is Test {
         assertEq(put.receipt().balanceOf(SAFE), size, "safe holds the receipts");
         assertEq(usdcBefore - USDC.balanceOf(SAFE), size - PREMIUM, "collateral locked, premium received");
 
-        assertTrue(_fromRoles(_orderCall(2, put, true, size, PREMIUM, 1 days)), "create buy");
+        // Buy back at 100 USDC: the tent caps this 47%-out-of-the-money put at about $103 for the lot.
+        uint256 buyBack = 100e6;
+        assertTrue(!_fromRoles(_orderCall(3, put, true, size, PREMIUM, 1 days)), "tent refuses 1,000 USDC");
+        assertTrue(_fromRoles(_orderCall(2, put, true, size, buyBack, 1 days)), "create buy");
         vm.prank(maker);
         put.approve(BEBOP, size);
-        IBebopSettlement.SingleOrder memory buy = _buyQuote(PREMIUM);
+        IBebopSettlement.SingleOrder memory buy = _buyQuote(buyBack);
         (buy.maker_token, buy.maker_amount) = (address(put), size);
         _submit(2, buy);
 
         assertEq(put.receipt().balanceOf(SAFE), 0, "receipts burned");
-        assertEq(USDC.balanceOf(SAFE), usdcBefore, "collateral back, premium paid back");
+        assertEq(USDC.balanceOf(SAFE), usdcBefore + PREMIUM - buyBack, "collateral back, net premium kept");
     }
 
     function _createOrder(uint256 nonce, uint256 minPremium, uint32 duration) internal {

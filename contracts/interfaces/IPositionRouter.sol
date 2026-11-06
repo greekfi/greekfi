@@ -29,7 +29,7 @@ interface IPositionRouter {
     /// @notice The market's strike is more than `STRIKE_BAND_BPS` from the oracle's spot price.
     error StrikeOutOfRange();
     /// @notice A sell's price is below the option's intrinsic value at spot, or a buy's is above
-    ///         intrinsic plus `MAX_TIME_VALUE_BPS` time value. See `priceBounds`. Checked on the
+    ///         intrinsic plus the time-value tent. See `priceBounds`. Checked on the
     ///         order's price at creation and on the fill's price at fill.
     error PriceOutOfBounds();
     /// @notice The oracle's answer is non-positive or older than `ORACLE_MAX_AGE`.
