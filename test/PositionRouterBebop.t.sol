@@ -20,6 +20,7 @@ contract PositionRouterBebopTest is Test {
     address constant BEBOP = 0xbbbbbBB520d69a9775E85b458C58c648259FAD5F;
     IERC20 constant WETH = IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
     IERC20 constant USDC = IERC20(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48);
+    IERC20 constant DAI = IERC20(0x6B175474E89094C44Da98b954EedeAC495271d0F);
     /// @dev endowment.ensdao.eth (Safe 1.3.0).
     address constant SAFE = 0x4F2083f5fBede34C2714aFfb3105539775f7FE64;
     /// @dev Roles Modifier v2.1.1, an enabled module on SAFE. Stands in for kpk's MANAGER role.
@@ -47,7 +48,7 @@ contract PositionRouterBebopTest is Test {
         vm.createSelectFork(vm.envOr("ETH_RPC_URL", string("https://ethereum-rpc.publicnode.com")));
 
         feed = new MockPriceFeed();
-        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(USDC), feed);
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), feed);
         option = IOption(
             FACTORY.createOption(
                 CreateParams({
@@ -89,7 +90,7 @@ contract PositionRouterBebopTest is Test {
         assertEq(USDC.balanceOf(SAFE) - usdcBefore, PREMIUM, "premium to safe");
         assertEq(wethBefore - WETH.balanceOf(SAFE), AMOUNT, "collateral locked");
         assertEq(option.balanceOf(address(router)), 0, "router holds nothing");
-        (,,, uint256 open,) = router.orders(SAFE, NONCE);
+        (,,,, uint256 open,) = router.orders(SAFE, NONCE);
         assertEq(open, 0, "order spent");
 
         vm.warp(option.receipt().exerciseDeadline() + 1);
@@ -255,7 +256,7 @@ contract PositionRouterBebopTest is Test {
         _sellThenReadyBuyBack(true);
         _createBuyOrder(2, PREMIUM);
         feed.set(2_600e8);
-        (, uint256 cap) = router.priceBounds(option);
+        (, uint256 cap) = router.priceBounds(option, address(USDC));
         assertApproxEqAbs(cap, 80.13e6, 0.01e6, "7-day cap at $2,600");
 
         _submitExpectingRevert(2, _buyQuote(PREMIUM), abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
@@ -342,6 +343,28 @@ contract PositionRouterBebopTest is Test {
         assertEq(USDC.balanceOf(SAFE), usdcBefore + PREMIUM - buyBack, "collateral back, net premium kept");
     }
 
+    /// @notice An order paid in DAI fills from a DAI quote, the premium is measured in DAI, and a
+    ///         USDC quote no longer fits it.
+    function testFork_SellPaidInDai() public {
+        uint256 premium = 1_000e18;
+        deal(address(DAI), maker, premium);
+        vm.prank(maker);
+        DAI.approve(BEBOP, type(uint256).max);
+        assertTrue(_fromRoles(_orderCallIn(NONCE, option, address(DAI), false, AMOUNT, premium, 1 days)), "create");
+
+        _submitExpectingRevert(NONCE, _quote(PREMIUM), abi.encodeWithSelector(IPositionRouter.QuoteMismatch.selector));
+
+        IBebopSettlement.SingleOrder memory quote = _quote(premium);
+        quote.maker_token = address(DAI);
+        uint256 daiBefore = DAI.balanceOf(SAFE);
+        uint256 usdcBefore = USDC.balanceOf(SAFE);
+        _submit(NONCE, quote);
+
+        assertEq(DAI.balanceOf(SAFE) - daiBefore, premium, "DAI premium to safe");
+        assertEq(USDC.balanceOf(SAFE), usdcBefore, "no USDC moved");
+        assertEq(option.balanceOf(maker), AMOUNT, "maker holds the options");
+    }
+
     function _createOrder(uint256 nonce, uint256 minPremium, uint32 duration) internal {
         assertTrue(_fromRoles(_orderCall(nonce, option, false, AMOUNT, minPremium, duration)), "create");
     }
@@ -357,6 +380,14 @@ contract PositionRouterBebopTest is Test {
         view
         returns (bytes memory)
     {
+        return _orderCallIn(nonce, market, address(USDC), isBuy, amount, premium, duration);
+    }
+
+    function _orderCallIn(uint256 nonce, IOption market, address premiumToken, bool isBuy, uint256 amount, uint256 premium, uint32 duration)
+        internal
+        view
+        returns (bytes memory)
+    {
         uint40 expiry = market.expirationDate();
         uint256 price = premium * 10 ** market.decimals() / amount;
         CreateParams memory terms = CreateParams({
@@ -368,7 +399,7 @@ contract PositionRouterBebopTest is Test {
             isEuro: market.isEuro(),
             windowSeconds: uint40(market.exerciseDeadline() - expiry)
         });
-        return abi.encodeCall(router.createOrder, (nonce, terms, isBuy, amount, price, duration));
+        return abi.encodeCall(router.createOrder, (nonce, terms, premiumToken, isBuy, amount, price, duration));
     }
 
     /// @dev The maker sells the options back: it pays them, the router pays USDC.

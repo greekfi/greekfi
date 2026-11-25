@@ -5,13 +5,15 @@ import { IOption } from "./IOption.sol";
 
 /// @notice Types, errors and events of the PositionRouter demo.
 interface IPositionRouter {
-    /// @param isBuy   Buy `amount` options back instead of writing and selling them.
-    /// @param premium Total USDC: the least a sell receives, or the most a buy pays. Set at creation
-    ///                from the per-option price.
+    /// @param isBuy        Buy `amount` options back instead of writing and selling them.
+    /// @param premiumToken Token the premium is paid in.
+    /// @param premium      Total `premiumToken`: the least a sell receives, or the most a buy pays. Set
+    ///                     at creation from the per-option price.
     struct Order {
         IOption option;
         uint40 deadline;
         bool isBuy;
+        address premiumToken;
         uint256 amount;
         uint256 premium;
     }
@@ -21,7 +23,8 @@ interface IPositionRouter {
     error UnknownOption();
     /// @notice The order's market breaks the order rules.
     error MarketNotAllowed();
-    /// @notice Zero amount or total premium, or the nonce already holds an open order.
+    /// @notice Zero amount or total premium, the option as its own premium token, or the nonce
+    ///         already holds an open order.
     error InvalidOrder();
     /// @notice The order's deadline falls more than `EXPIRY_BUFFER` after its market's expiry.
     error OrderOutlivesMarket();
@@ -39,15 +42,22 @@ interface IPositionRouter {
     error UnknownOrder();
     /// @notice The order's deadline has passed.
     error OrderExpired();
-    /// @notice The quote does not trade exactly this order's option and amount for USDC with the router.
+    /// @notice The quote does not trade exactly this order's option and amount for its premium token with the router.
     error QuoteMismatch();
-    /// @notice A sell paid the account less USDC than the order's premium.
+    /// @notice A sell paid the account less premium token than the order's premium.
     error PremiumTooLow();
-    /// @notice A buy would pay more USDC than the order's premium.
+    /// @notice A buy would pay more premium token than the order's premium.
     error PremiumTooHigh();
 
     event OrderCreated(
-        address indexed account, uint256 indexed nonce, IOption option, bool isBuy, uint256 amount, uint256 premium, uint40 deadline
+        address indexed account,
+        uint256 indexed nonce,
+        IOption option,
+        address premiumToken,
+        bool isBuy,
+        uint256 amount,
+        uint256 premium,
+        uint40 deadline
     );
     event OrderCancelled(address indexed account, uint256 indexed nonce);
     event OrderFilled(address indexed account, uint256 indexed nonce, address indexed maker, uint256 premium);

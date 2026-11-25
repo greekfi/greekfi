@@ -50,7 +50,7 @@ contract PositionRouterTest is Test {
     function setUp() public {
         vm.createSelectFork(vm.envOr("ETH_RPC_URL", string("https://ethereum-rpc.publicnode.com")));
         feed = new MockPriceFeed();
-        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(USDC), feed);
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), feed);
         (opt, rct) = _newOption(3_000e18, false);
 
         address[3] memory who = [alice, bob, mallory];
@@ -146,8 +146,9 @@ contract PositionRouterTest is Test {
         (IOption euro,) = _newOption(3_000e18, true);
 
         _sell(7, _terms(euro), "");
-        (IOption stored, uint40 deadline, bool isBuy, uint256 amount, uint256 premium) = router.orders(alice, 7);
+        (IOption stored, uint40 deadline, bool isBuy, address premiumToken, uint256 amount, uint256 premium) = router.orders(alice, 7);
         assertEq(address(stored), address(euro), "option");
+        assertEq(premiumToken, address(USDC), "premium token");
         assertEq(deadline, block.timestamp + 10 minutes, "deadline");
         assertEq(amount, 1 ether, "amount");
         assertFalse(isBuy, "sell");
@@ -157,7 +158,7 @@ contract PositionRouterTest is Test {
 
         vm.prank(alice);
         router.cancelOrder(7);
-        (,,, amount,) = router.orders(alice, 7);
+        (,,,, amount,) = router.orders(alice, 7);
         assertEq(amount, 0, "cancelled");
     }
 
@@ -214,6 +215,25 @@ contract PositionRouterTest is Test {
         _order(4, t, false, 1 ether, 100e6, 0, outlives);
     }
 
+    /// @notice The bounds are in the premium token's own units, one whole token to the dollar: a $500
+    ///         floor is 500e6 USDC and 500e18 DAI. An option cannot be its own premium token.
+    function testFork_CreateOrder_BoundsScaleToPremiumToken() public {
+        bytes memory outOfBounds = abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector);
+        (IOption itmCall,) = _newOption(2_500e18, true); // $500 in the money
+        CreateParams memory t = _terms(itmCall);
+
+        (uint256 floor,) = router.priceBounds(itmCall, DAI);
+        assertEq(floor, 500e18, "DAI floor");
+        _orderIn(1, t, DAI, false, 1 ether, 500e18, 10 minutes, "");
+        _orderIn(2, t, DAI, false, 1 ether, 500e18 - 1, 10 minutes, outOfBounds);
+        _orderIn(3, t, DAI, false, 1 ether, 500e6, 10 minutes, outOfBounds); // USDC units, in DAI
+        (,,, address token,, uint256 premium) = router.orders(alice, 1);
+        assertEq(token, DAI, "stored token");
+        assertEq(premium, 500e18, "stored premium");
+
+        _orderIn(4, t, address(itmCall), false, 1 ether, 500e18, 10 minutes, abi.encodeWithSelector(IPositionRouter.InvalidOrder.selector));
+    }
+
     /// @notice A sell's price may not go below intrinsic value at spot ($3,000).
     function testFork_CreateOrder_SellFloorIsIntrinsic() public {
         bytes memory outOfBounds = abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector);
@@ -231,7 +251,7 @@ contract PositionRouterTest is Test {
 
         // Out of the money, the floor is 0.
         (IOption otmCall,) = _newOption(3_500e18, true);
-        (uint256 floor,) = router.priceBounds(otmCall);
+        (uint256 floor,) = router.priceBounds(otmCall, address(USDC));
         assertEq(floor, 0, "OTM call floor");
     }
 
@@ -242,7 +262,7 @@ contract PositionRouterTest is Test {
     function testFork_CreateOrder_BuyCapIsTent() public {
         bytes memory outOfBounds = abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector);
         (IOption atm,) = _newOption(3_000e18, true);
-        (uint256 floor, uint256 cap) = router.priceBounds(atm);
+        (uint256 floor, uint256 cap) = router.priceBounds(atm, address(USDC));
         assertEq(floor, 0, "ATM floor");
         assertApproxEqAbs(cap, 176.11e6, 0.01e6, "1-day cap at the strike");
         CreateParams memory t = _terms(atm);
@@ -250,12 +270,12 @@ contract PositionRouterTest is Test {
         _order(2, t, true, 1 ether, cap + 1, 10 minutes, outOfBounds);
 
         (IOption itm,) = _newOption(2_500e18, true);
-        (floor, cap) = router.priceBounds(itm);
+        (floor, cap) = router.priceBounds(itm, address(USDC));
         assertEq(floor, 500e6, "ITM floor: intrinsic at spot");
         assertApproxEqAbs(cap, 546.99e6, 0.01e6, "1-day ITM cap");
 
         (IOption edge,) = _newOption(4_500e18, true);
-        (, cap) = router.priceBounds(edge);
+        (, cap) = router.priceBounds(edge, address(USDC));
         assertApproxEqAbs(cap, 8.07e6, 0.01e6, "the tent tapers away from the strike");
     }
 
@@ -268,16 +288,16 @@ contract PositionRouterTest is Test {
         CreateParams memory t = _terms(itm);
 
         vm.warp(t.expirationDate);
-        (uint256 floor, uint256 cap) = router.priceBounds(itm);
+        (uint256 floor, uint256 cap) = router.priceBounds(itm, address(USDC));
         assertEq(floor, 500e6, "intrinsic in the window");
         assertEq(cap, 530e6, "intrinsic at spot +0.5%, plus 0.5% of spot");
-        (, uint256 otmCap) = router.priceBounds(otm);
+        (, uint256 otmCap) = router.priceBounds(otm, address(USDC));
         assertEq(otmCap, 15e6, "out of the money: the buffer alone");
         _order(1, t, true, 1 ether, cap, 10 minutes, "");
         _order(2, t, true, 1 ether, cap + 1, 10 minutes, abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
 
         vm.warp(t.expirationDate + t.windowSeconds + 1);
-        (floor, cap) = router.priceBounds(itm);
+        (floor, cap) = router.priceBounds(itm, address(USDC));
         assertEq(floor + cap, 0, "worthless after the window");
         _order(3, t, true, 1 ether, 1, 10 minutes, abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector));
     }
@@ -288,7 +308,7 @@ contract PositionRouterTest is Test {
     function testFork_CreateOrder_BuyBackSkipsBand() public {
         (IOption farCall,) = _newOption(1_400e18, true); // $1,600 in the money at $3,000
         CreateParams memory t = _terms(farCall);
-        (, uint256 cap) = router.priceBounds(farCall);
+        (, uint256 cap) = router.priceBounds(farCall, address(USDC));
 
         _order(1, t, false, 1 ether, 1_600e6, 10 minutes, abi.encodeWithSelector(IPositionRouter.StrikeOutOfRange.selector));
         _order(2, t, true, 1 ether, cap, 10 minutes, "");
@@ -342,7 +362,7 @@ contract PositionRouterTest is Test {
     /// @notice Against the live Chainlink ETH / USD feed: a strike at spot passes, one at twice
     ///         spot does not.
     function testFork_CreateOrder_LiveChainlinkFeed() public {
-        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(USDC), CHAINLINK_ETH_USD);
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), CHAINLINK_ETH_USD);
         (, int256 answer,,,) = CHAINLINK_ETH_USD.latestRoundData();
         uint256 spot = uint256(answer) / 1e8 * 1e18; // whole dollars, 18 decimals
         (IOption atSpot,) = _newOption(spot, true);
@@ -390,8 +410,8 @@ contract PositionRouterTest is Test {
 
         _sell(1, _terms(euro), "");
         _sell(2, _terms(other), "");
-        (IOption first,,,,) = router.orders(alice, 1);
-        (IOption second,,,,) = router.orders(alice, 2);
+        (IOption first,,,,,) = router.orders(alice, 1);
+        (IOption second,,,,,) = router.orders(alice, 2);
         assertEq(address(first), address(euro));
         assertEq(address(second), address(other));
     }
@@ -452,13 +472,26 @@ contract PositionRouterTest is Test {
     function _order(uint256 nonce, CreateParams memory t, bool isBuy, uint256 amount, uint256 price, uint32 duration, bytes memory err)
         internal
     {
+        _orderIn(nonce, t, address(USDC), isBuy, amount, price, duration, err);
+    }
+
+    function _orderIn(
+        uint256 nonce,
+        CreateParams memory t,
+        address premiumToken,
+        bool isBuy,
+        uint256 amount,
+        uint256 price,
+        uint32 duration,
+        bytes memory err
+    ) internal {
         if (err.length != 0) vm.expectRevert(err);
         vm.prank(alice);
-        router.createOrder(nonce, t, isBuy, amount, price, duration);
+        router.createOrder(nonce, t, premiumToken, isBuy, amount, price, duration);
     }
 
     function _premium(uint256 nonce) internal view returns (uint256 premium) {
-        (,,,, premium) = router.orders(alice, nonce);
+        (,,,,, premium) = router.orders(alice, nonce);
     }
 
     function _newOption(uint256 strike, bool isEuro) internal returns (IOption option, IReceipt receipt) {
