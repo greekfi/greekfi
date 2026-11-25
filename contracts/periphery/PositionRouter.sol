@@ -7,7 +7,7 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { ReentrancyGuardTransient } from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 
-import { IFactory } from "../interfaces/IFactory.sol";
+import { CreateParams, IFactory } from "../interfaces/IFactory.sol";
 import { IOption } from "../interfaces/IOption.sol";
 import { IReceipt } from "../interfaces/IReceipt.sol";
 import { IBebopSettlement } from "../interfaces/IBebopSettlement.sol";
@@ -51,8 +51,7 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     IFactory public immutable FACTORY;
     /// @notice Bebop settlement contract that {submitOrder} settles on.
     IBebopSettlement public immutable BEBOP;
-    /// @notice The two tokens an order's market may pair, and the premium token is {USDC}.
-    address public immutable WETH;
+    /// @notice The premium token: sells are paid in it and buy-backs pay in it.
     address public immutable USDC;
     /// @notice ETH / USD price feed for the strike band. USD stands in for USDC; at a ±50% band a
     ///         USDC depeg would have to be extreme to matter.
@@ -98,10 +97,9 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     /// @notice Open limit orders by account and account-chosen nonce.
     mapping(address account => mapping(uint256 nonce => Order)) public orders;
 
-    constructor(IFactory factory_, IBebopSettlement bebop_, address weth_, address usdc_, IPriceFeed oracle_) {
+    constructor(IFactory factory_, IBebopSettlement bebop_, address usdc_, IPriceFeed oracle_) {
         FACTORY = factory_;
         BEBOP = bebop_;
-        WETH = weth_;
         USDC = usdc_;
         ORACLE = oracle_;
         ORACLE_SCALE = 10 ** (18 - oracle_.decimals());
@@ -120,60 +118,49 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
         }
     }
 
-    /// @notice Offer to write and sell `amount` of `option` for at least `price` USDC per option, or
-    ///         with `isBuy` to buy `amount` back for at most `price` per option, until `duration`
-    ///         seconds from now. The market must be European, pair {WETH} with {USDC} (a put exactly
-    ///         when USDC is the collateral), fit {MAX_TENOR} and {MAX_WINDOW}, expire no more than
-    ///         {EXPIRY_BUFFER} before the order's deadline, and, for a sell, have its strike within
-    ///         {STRIKE_BAND_BPS} of spot (a buy-back skips the band, so a position spot has run away
-    ///         from can still be closed). `price` must sit within {priceBounds} at spot now: at least
-    ///         intrinsic value for a sell, at most intrinsic plus the time-value tent for a buy.
+    /// @notice Offer to write and sell `amount` of the market `terms` names for at least `price` USDC
+    ///         per option, or with `isBuy` to buy `amount` back for at most `price` per option, until
+    ///         `duration` seconds from now. The market must be European, fit {MAX_TENOR} and
+    ///         {MAX_WINDOW}, expire no more than {EXPIRY_BUFFER} before the order's deadline, and, for
+    ///         a sell, have its strike within {STRIKE_BAND_BPS} of spot (a buy-back skips the band, so
+    ///         a position spot has run away from can still be closed). `price` must sit within
+    ///         {priceBounds} at spot now: at least intrinsic value for a sell, at most intrinsic plus
+    ///         the time-value tent for a buy.
     ///         {submitOrder} checks the fill's own price against the same bounds at fill time.
     ///
-    ///         `strike` through `windowSeconds` restate `option`'s terms and must match them exactly.
-    ///         They are in the calldata so the Roles Modifier can pin or bound them; the router
-    ///         checks them against the market. A put's `strike` is the inverted `1e36 / humanStrike`,
-    ///         so its bounds invert too.
+    ///         `terms` is the market's {CreateParams}, all seven fields, token pair included, so the
+    ///         Roles Modifier can pin or bound each one. The router looks the market up as
+    ///         `FACTORY.optionFor(FACTORY.optionKey(terms))`; the factory writes that entry once, when
+    ///         it deploys the market from exactly these params, so the terms are the market's own by
+    ///         construction. The market must already exist: the router never creates one.
+    ///         A put's `strike` is the inverted `1e36 / humanStrike`, so its bounds invert too.
+    ///
+    ///         The router does not restrict the token pair or tie `isPut` to the collateral; the
+    ///         Roles Modifier pins them. {priceBounds} still values every market against the
+    ///         {ORACLE}'s ETH / USD spot in {USDC}, so its bounds mean something only for a
+    ///         WETH / USDC pair with `isPut` set exactly when USDC is the collateral.
     /// @param price    USDC base units per whole option (`10 ** option.decimals()` units): a sell's
     ///                 floor or a buy's cap, for the Roles Modifier to bound. The stored total rounds in
     ///                 the account's favour, up for a sell and down for a buy.
     /// @param duration Lifetime of the order, for the Roles Modifier to cap.
-    function createOrder(
-        uint256 nonce,
-        IOption option,
-        uint256 strike,
-        uint40 expirationDate,
-        bool isPut,
-        bool isEuro,
-        uint40 windowSeconds,
-        bool isBuy,
-        uint256 amount,
-        uint256 price,
-        uint32 duration
-    ) external {
+    function createOrder(uint256 nonce, CreateParams calldata terms, bool isBuy, uint256 amount, uint256 price, uint32 duration) external {
         if (amount == 0 || orders[msg.sender][nonce].amount != 0) revert InvalidOrder();
 
-        IReceipt receipt = _receiptOf(option);
-        if (
-            receipt.strike() != strike || receipt.expirationDate() != expirationDate || receipt.isPut() != isPut
-                || receipt.isEuro() != isEuro || receipt.exerciseDeadline() - expirationDate != windowSeconds
-        ) revert TermsMismatch();
+        IOption option = IOption(FACTORY.optionFor(FACTORY.optionKey(terms)));
+        if (address(option) == address(0)) revert UnknownOption();
 
-        address coll = address(receipt.collateral());
-        address cons = address(receipt.consideration());
-        // `isPut` is only a label in the factory; tie it to the collateral so the side Roles pins is real.
-        if (
-            !isEuro || expirationDate > block.timestamp + MAX_TENOR || windowSeconds > MAX_WINDOW || isPut != (coll == USDC)
-                || !((coll == WETH && cons == USDC) || (coll == USDC && cons == WETH))
-        ) revert MarketNotAllowed();
+        if (!terms.isEuro || terms.expirationDate > block.timestamp + MAX_TENOR || terms.windowSeconds > MAX_WINDOW) {
+            revert MarketNotAllowed();
+        }
 
         uint40 deadline = uint40(block.timestamp + duration);
         // Fixed for the order's life: no fill comes after `deadline`, so none comes later than this after expiry.
-        if (deadline > uint256(expirationDate) + EXPIRY_BUFFER) revert OrderOutlivesMarket();
+        if (deadline > uint256(terms.expirationDate) + EXPIRY_BUFFER) revert OrderOutlivesMarket();
 
         uint256 spot = _spot();
-        if (!isBuy) _checkStrike(strike, isPut, spot);
-        (uint256 minSellPrice, uint256 maxBuyPrice) = _priceBounds(strike, isPut, expirationDate, windowSeconds, spot);
+        if (!isBuy) _checkStrike(terms.strike, terms.isPut, spot);
+        (uint256 minSellPrice, uint256 maxBuyPrice) =
+            _priceBounds(terms.strike, terms.isPut, terms.expirationDate, terms.windowSeconds, spot);
         if (isBuy ? price > maxBuyPrice : price < minSellPrice) revert PriceOutOfBounds();
 
         uint256 premium = Math.mulDiv(amount, price, 10 ** option.decimals(), isBuy ? Math.Rounding.Floor : Math.Rounding.Ceil);

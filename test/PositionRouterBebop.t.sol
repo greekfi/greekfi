@@ -47,7 +47,7 @@ contract PositionRouterBebopTest is Test {
         vm.createSelectFork(vm.envOr("ETH_RPC_URL", string("https://ethereum-rpc.publicnode.com")));
 
         feed = new MockPriceFeed();
-        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC), feed);
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(USDC), feed);
         option = IOption(
             FACTORY.createOption(
                 CreateParams({
@@ -359,22 +359,16 @@ contract PositionRouterBebopTest is Test {
     {
         uint40 expiry = market.expirationDate();
         uint256 price = premium * 10 ** market.decimals() / amount;
-        return abi.encodeCall(
-            router.createOrder,
-            (
-                nonce,
-                market,
-                market.strike(),
-                expiry,
-                market.isPut(),
-                market.isEuro(),
-                uint40(market.exerciseDeadline() - expiry),
-                isBuy,
-                amount,
-                price,
-                duration
-            )
-        );
+        CreateParams memory terms = CreateParams({
+            collateral: market.collateral(),
+            consideration: market.consideration(),
+            expirationDate: expiry,
+            strike: market.strike(),
+            isPut: market.isPut(),
+            isEuro: market.isEuro(),
+            windowSeconds: uint40(market.exerciseDeadline() - expiry)
+        });
+        return abi.encodeCall(router.createOrder, (nonce, terms, isBuy, amount, price, duration));
     }
 
     /// @dev The maker sells the options back: it pays them, the router pays USDC.
