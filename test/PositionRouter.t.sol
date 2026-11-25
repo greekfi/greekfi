@@ -29,6 +29,7 @@ contract PositionRouterTest is Test {
     address constant BEBOP = 0xbbbbbBB520d69a9775E85b458C58c648259FAD5F;
     IERC20 constant WETH = IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
     IERC20 constant USDC = IERC20(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48);
+    address constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
     /// @dev Chainlink ETH / USD.
     IPriceFeed constant CHAINLINK_ETH_USD = IPriceFeed(0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419);
 
@@ -49,7 +50,7 @@ contract PositionRouterTest is Test {
     function setUp() public {
         vm.createSelectFork(vm.envOr("ETH_RPC_URL", string("https://ethereum-rpc.publicnode.com")));
         feed = new MockPriceFeed();
-        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC), feed);
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(USDC), feed);
         (opt, rct) = _newOption(3_000e18, false);
 
         address[3] memory who = [alice, bob, mallory];
@@ -164,7 +165,7 @@ contract PositionRouterTest is Test {
     ///         so a dust order can't sell for nothing or buy for a full cap (the old H-01 path).
     function testFork_CreateOrder_PricesPerOption() public {
         (IOption euro,) = _newOption(3_000e18, true);
-        Terms memory t = _terms(euro);
+        CreateParams memory t = _terms(euro);
         bytes memory invalid = abi.encodeWithSelector(IPositionRouter.InvalidOrder.selector);
 
         _order(1, euro, t, false, 1.5 ether, 100e6, 10 minutes, "");
@@ -185,7 +186,7 @@ contract PositionRouterTest is Test {
 
         _sell(1, opt, _terms(opt), notAllowed); // American
         _sell(1, longWindow, _terms(longWindow), notAllowed);
-        _sell(1, impostor, _terms(opt), abi.encodeWithSelector(IPositionRouter.UnknownOption.selector));
+        _sell(1, impostor, _terms(opt), abi.encodeWithSelector(IPositionRouter.TermsMismatch.selector));
     }
 
     /// @notice Markets may expire up to MAX_TENOR (35 days) out.
@@ -201,7 +202,7 @@ contract PositionRouterTest is Test {
     ///         that expired longer ago than that can't be ordered at all.
     function testFork_CreateOrder_EndsWithinBufferAfterExpiry() public {
         (IOption euro,) = _newOption(3_000e18, true); // expires in 1 day
-        Terms memory t = _terms(euro);
+        CreateParams memory t = _terms(euro);
         uint32 latest = uint32(1 days + router.EXPIRY_BUFFER());
         bytes memory outlives = abi.encodeWithSelector(IPositionRouter.OrderOutlivesMarket.selector);
 
@@ -219,7 +220,7 @@ contract PositionRouterTest is Test {
     function testFork_CreateOrder_SellFloorIsIntrinsic() public {
         bytes memory outOfBounds = abi.encodeWithSelector(IPositionRouter.PriceOutOfBounds.selector);
         (IOption itmCall,) = _newOption(2_500e18, true); // $500 in the money
-        Terms memory t = _terms(itmCall);
+        CreateParams memory t = _terms(itmCall);
         _order(1, itmCall, t, false, 1 ether, 500e6, 10 minutes, "");
         _order(2, itmCall, t, false, 1 ether, 500e6 - 1, 10 minutes, outOfBounds);
 
@@ -246,7 +247,7 @@ contract PositionRouterTest is Test {
         (uint256 floor, uint256 cap) = router.priceBounds(atm);
         assertEq(floor, 0, "ATM floor");
         assertApproxEqAbs(cap, 176.11e6, 0.01e6, "1-day cap at the strike");
-        Terms memory t = _terms(atm);
+        CreateParams memory t = _terms(atm);
         _order(1, atm, t, true, 1 ether, cap, 10 minutes, "");
         _order(2, atm, t, true, 1 ether, cap + 1, 10 minutes, outOfBounds);
 
@@ -266,7 +267,7 @@ contract PositionRouterTest is Test {
     function testFork_CreateOrder_BuyCapAfterExpiry() public {
         (IOption itm,) = _newOption(2_500e18, true);
         (IOption otm,) = _newOption(3_300e18, true);
-        Terms memory t = _terms(itm);
+        CreateParams memory t = _terms(itm);
 
         vm.warp(t.expirationDate);
         (uint256 floor, uint256 cap) = router.priceBounds(itm);
@@ -288,7 +289,7 @@ contract PositionRouterTest is Test {
     ///         posted, so a position spot has run away from can be closed.
     function testFork_CreateOrder_BuyBackSkipsBand() public {
         (IOption farCall,) = _newOption(1_400e18, true); // $1,600 in the money at $3,000
-        Terms memory t = _terms(farCall);
+        CreateParams memory t = _terms(farCall);
         (, uint256 cap) = router.priceBounds(farCall);
 
         _order(1, farCall, t, false, 1 ether, 1_600e6, 10 minutes, abi.encodeWithSelector(IPositionRouter.StrikeOutOfRange.selector));
@@ -343,7 +344,7 @@ contract PositionRouterTest is Test {
     /// @notice Against the live Chainlink ETH / USD feed: a strike at spot passes, one at twice
     ///         spot does not.
     function testFork_CreateOrder_LiveChainlinkFeed() public {
-        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC), CHAINLINK_ETH_USD);
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(USDC), CHAINLINK_ETH_USD);
         (, int256 answer,,,) = CHAINLINK_ETH_USD.latestRoundData();
         uint256 spot = uint256(answer) / 1e8 * 1e18; // whole dollars, 18 decimals
         (IOption atSpot,) = _newOption(spot, true);
@@ -358,7 +359,7 @@ contract PositionRouterTest is Test {
         (IOption euro,) = _newOption(3_000e18, true);
         bytes memory mismatch = abi.encodeWithSelector(IPositionRouter.TermsMismatch.selector);
 
-        Terms memory t = _terms(euro);
+        CreateParams memory t = _terms(euro);
         t.strike = 1;
         _sell(1, euro, t, mismatch);
         t = _terms(euro);
@@ -373,11 +374,46 @@ contract PositionRouterTest is Test {
         t = _terms(euro);
         t.windowSeconds -= 1;
         _sell(1, euro, t, mismatch);
+        t = _terms(euro);
+        (t.collateral, t.consideration) = (t.consideration, t.collateral);
+        _sell(1, euro, t, mismatch);
+        t = _terms(euro);
+        t.consideration = address(0xdead);
+        _sell(1, euro, t, mismatch);
     }
 
-    /// @notice The factory lets a WETH-collateral call carry `isPut = true`. With a put-range strike
-    ///         (`1e36 / 2_500e18`) it is a $0.0004 call, so the router refuses the label.
-    function testFork_CreateOrder_RejectsMislabeledPut() public {
+    /// @notice Another real market's terms do not authorise `option`, and a zero `option` does not
+    ///         match terms the factory has never registered.
+    function testFork_CreateOrder_RejectsTermsOfAnotherOrNoMarket() public {
+        (IOption euro,) = _newOption(3_000e18, true);
+        (IOption other,) = _newOption(3_100e18, true);
+        bytes memory mismatch = abi.encodeWithSelector(IPositionRouter.TermsMismatch.selector);
+
+        _sell(1, euro, _terms(other), mismatch);
+        _sell(1, other, _terms(euro), mismatch);
+
+        CreateParams memory unregistered = _terms(euro);
+        unregistered.strike = 3_200e18;
+        _sell(1, IOption(address(0)), unregistered, mismatch);
+    }
+
+    /// @notice The router leaves the token pair and the put label to the Roles preset: it accepts a
+    ///         WETH / DAI market, and a WETH-collateral call labelled `isPut` (with a put-range strike,
+    ///         `1e36 / 2_500e18`, a $0.0004 call that the router prices as a $2,500 put).
+    function testFork_CreateOrder_LeavesPairAndSideToRoles() public {
+        IOption daiCall = IOption(
+            FACTORY.createOption(
+                CreateParams({
+                    collateral: address(WETH),
+                    consideration: DAI,
+                    expirationDate: uint40(block.timestamp + 1 days),
+                    strike: 3_000e18,
+                    isPut: false,
+                    isEuro: true,
+                    windowSeconds: 1 hours
+                })
+            )
+        );
         IOption mislabeled = IOption(
             FACTORY.createOption(
                 CreateParams({
@@ -391,31 +427,33 @@ contract PositionRouterTest is Test {
                 })
             )
         );
-        _sell(1, mislabeled, _terms(mislabeled), abi.encodeWithSelector(IPositionRouter.MarketNotAllowed.selector));
+        _sell(1, daiCall, _terms(daiCall), "");
+        _sell(2, mislabeled, _terms(mislabeled), "");
     }
 
-    struct Terms {
-        uint256 strike;
-        uint40 expirationDate;
-        bool isPut;
-        bool isEuro;
-        uint40 windowSeconds;
-    }
-
-    function _terms(IOption option) internal view returns (Terms memory t) {
-        t = Terms(option.strike(), option.expirationDate(), option.isPut(), option.isEuro(), 0);
+    /// @dev `option`'s own {CreateParams}, as a caller would restate them.
+    function _terms(IOption option) internal view returns (CreateParams memory t) {
+        t = CreateParams({
+            collateral: option.collateral(),
+            consideration: option.consideration(),
+            expirationDate: option.expirationDate(),
+            strike: option.strike(),
+            isPut: option.isPut(),
+            isEuro: option.isEuro(),
+            windowSeconds: 0
+        });
         t.windowSeconds = uint40(option.exerciseDeadline() - t.expirationDate);
     }
 
     /// @dev Alice offers to sell 1 option at 100 USDC for 10 minutes, expecting `err` if non-empty.
-    function _sell(uint256 nonce, IOption option, Terms memory t, bytes memory err) internal {
+    function _sell(uint256 nonce, IOption option, CreateParams memory t, bytes memory err) internal {
         _order(nonce, option, t, false, 1 ether, 100e6, 10 minutes, err);
     }
 
     function _order(
         uint256 nonce,
         IOption option,
-        Terms memory t,
+        CreateParams memory t,
         bool isBuy,
         uint256 amount,
         uint256 price,
@@ -424,7 +462,7 @@ contract PositionRouterTest is Test {
     ) internal {
         if (err.length != 0) vm.expectRevert(err);
         vm.prank(alice);
-        router.createOrder(nonce, option, t.strike, t.expirationDate, t.isPut, t.isEuro, t.windowSeconds, isBuy, amount, price, duration);
+        router.createOrder(nonce, option, t, isBuy, amount, price, duration);
     }
 
     function _premium(uint256 nonce) internal view returns (uint256 premium) {
