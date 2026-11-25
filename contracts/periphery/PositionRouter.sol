@@ -51,8 +51,7 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     IFactory public immutable FACTORY;
     /// @notice Bebop settlement contract that {submitOrder} settles on.
     IBebopSettlement public immutable BEBOP;
-    /// @notice The two tokens an order's market may pair, and the premium token is {USDC}.
-    address public immutable WETH;
+    /// @notice The premium token: sells are paid in it and buy-backs pay in it.
     address public immutable USDC;
     /// @notice ETH / USD price feed for the strike band. USD stands in for USDC; at a ±50% band a
     ///         USDC depeg would have to be extreme to matter.
@@ -98,10 +97,9 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     /// @notice Open limit orders by account and account-chosen nonce.
     mapping(address account => mapping(uint256 nonce => Order)) public orders;
 
-    constructor(IFactory factory_, IBebopSettlement bebop_, address weth_, address usdc_, IPriceFeed oracle_) {
+    constructor(IFactory factory_, IBebopSettlement bebop_, address usdc_, IPriceFeed oracle_) {
         FACTORY = factory_;
         BEBOP = bebop_;
-        WETH = weth_;
         USDC = usdc_;
         ORACLE = oracle_;
         ORACLE_SCALE = 10 ** (18 - oracle_.decimals());
@@ -122,9 +120,9 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
 
     /// @notice Offer to write and sell `amount` of `option` for at least `price` USDC per option, or
     ///         with `isBuy` to buy `amount` back for at most `price` per option, until `duration`
-    ///         seconds from now. The market must be European, pair {WETH} with {USDC} (a put exactly
-    ///         when USDC is the collateral), fit {MAX_TENOR} and {MAX_WINDOW}, expire no more than
-    ///         {EXPIRY_BUFFER} before the order's deadline, and, for a sell, have its strike within
+    ///         seconds from now. The market must be European, fit {MAX_TENOR} and {MAX_WINDOW},
+    ///         expire no more than {EXPIRY_BUFFER} before the order's deadline, and, for a sell, have
+    ///         its strike within
     ///         {STRIKE_BAND_BPS} of spot (a buy-back skips the band, so a position spot has run away
     ///         from can still be closed). `price` must sit within {priceBounds} at spot now: at least
     ///         intrinsic value for a sell, at most intrinsic plus the time-value tent for a buy.
@@ -136,6 +134,11 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     ///         writes that entry once, when it deploys the market from exactly these params, so a
     ///         match proves both that `option` is a factory market and that `terms` are its own.
     ///         A put's `strike` is the inverted `1e36 / humanStrike`, so its bounds invert too.
+    ///
+    ///         The router does not restrict the token pair or tie `isPut` to the collateral; the
+    ///         Roles Modifier pins them. {priceBounds} still values every market against the
+    ///         {ORACLE}'s ETH / USD spot in {USDC}, so its bounds mean something only for a
+    ///         WETH / USDC pair with `isPut` set exactly when USDC is the collateral.
     /// @param price    USDC base units per whole option (`10 ** option.decimals()` units): a sell's
     ///                 floor or a buy's cap, for the Roles Modifier to bound. The stored total rounds in
     ///                 the account's favour, up for a sell and down for a buy.
@@ -156,22 +159,18 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
             revert TermsMismatch();
         }
 
-        (address coll, address cons) = (terms.collateral, terms.consideration);
-        (uint256 strike, uint40 expirationDate, bool isPut, uint40 windowSeconds) =
-            (terms.strike, terms.expirationDate, terms.isPut, terms.windowSeconds);
-        // `isPut` is only a label in the factory; tie it to the collateral so the side Roles pins is real.
-        if (
-            !terms.isEuro || expirationDate > block.timestamp + MAX_TENOR || windowSeconds > MAX_WINDOW || isPut != (coll == USDC)
-                || !((coll == WETH && cons == USDC) || (coll == USDC && cons == WETH))
-        ) revert MarketNotAllowed();
+        if (!terms.isEuro || terms.expirationDate > block.timestamp + MAX_TENOR || terms.windowSeconds > MAX_WINDOW) {
+            revert MarketNotAllowed();
+        }
 
         uint40 deadline = uint40(block.timestamp + duration);
         // Fixed for the order's life: no fill comes after `deadline`, so none comes later than this after expiry.
-        if (deadline > uint256(expirationDate) + EXPIRY_BUFFER) revert OrderOutlivesMarket();
+        if (deadline > uint256(terms.expirationDate) + EXPIRY_BUFFER) revert OrderOutlivesMarket();
 
         uint256 spot = _spot();
-        if (!isBuy) _checkStrike(strike, isPut, spot);
-        (uint256 minSellPrice, uint256 maxBuyPrice) = _priceBounds(strike, isPut, expirationDate, windowSeconds, spot);
+        if (!isBuy) _checkStrike(terms.strike, terms.isPut, spot);
+        (uint256 minSellPrice, uint256 maxBuyPrice) =
+            _priceBounds(terms.strike, terms.isPut, terms.expirationDate, terms.windowSeconds, spot);
         if (isBuy ? price > maxBuyPrice : price < minSellPrice) revert PriceOutOfBounds();
 
         uint256 premium = Math.mulDiv(amount, price, 10 ** option.decimals(), isBuy ? Math.Rounding.Floor : Math.Rounding.Ceil);

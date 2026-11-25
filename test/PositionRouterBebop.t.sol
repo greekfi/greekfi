@@ -47,7 +47,7 @@ contract PositionRouterBebopTest is Test {
         vm.createSelectFork(vm.envOr("ETH_RPC_URL", string("https://ethereum-rpc.publicnode.com")));
 
         feed = new MockPriceFeed();
-        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC), feed);
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(USDC), feed);
         option = IOption(
             FACTORY.createOption(
                 CreateParams({

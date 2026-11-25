@@ -29,6 +29,7 @@ contract PositionRouterTest is Test {
     address constant BEBOP = 0xbbbbbBB520d69a9775E85b458C58c648259FAD5F;
     IERC20 constant WETH = IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
     IERC20 constant USDC = IERC20(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48);
+    address constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
     /// @dev Chainlink ETH / USD.
     IPriceFeed constant CHAINLINK_ETH_USD = IPriceFeed(0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419);
 
@@ -49,7 +50,7 @@ contract PositionRouterTest is Test {
     function setUp() public {
         vm.createSelectFork(vm.envOr("ETH_RPC_URL", string("https://ethereum-rpc.publicnode.com")));
         feed = new MockPriceFeed();
-        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC), feed);
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(USDC), feed);
         (opt, rct) = _newOption(3_000e18, false);
 
         address[3] memory who = [alice, bob, mallory];
@@ -343,7 +344,7 @@ contract PositionRouterTest is Test {
     /// @notice Against the live Chainlink ETH / USD feed: a strike at spot passes, one at twice
     ///         spot does not.
     function testFork_CreateOrder_LiveChainlinkFeed() public {
-        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(WETH), address(USDC), CHAINLINK_ETH_USD);
+        router = new PositionRouter(FACTORY, IBebopSettlement(BEBOP), address(USDC), CHAINLINK_ETH_USD);
         (, int256 answer,,,) = CHAINLINK_ETH_USD.latestRoundData();
         uint256 spot = uint256(answer) / 1e8 * 1e18; // whole dollars, 18 decimals
         (IOption atSpot,) = _newOption(spot, true);
@@ -396,9 +397,23 @@ contract PositionRouterTest is Test {
         _sell(1, IOption(address(0)), unregistered, mismatch);
     }
 
-    /// @notice The factory lets a WETH-collateral call carry `isPut = true`. With a put-range strike
-    ///         (`1e36 / 2_500e18`) it is a $0.0004 call, so the router refuses the label.
-    function testFork_CreateOrder_RejectsMislabeledPut() public {
+    /// @notice The router leaves the token pair and the put label to the Roles preset: it accepts a
+    ///         WETH / DAI market, and a WETH-collateral call labelled `isPut` (with a put-range strike,
+    ///         `1e36 / 2_500e18`, a $0.0004 call that the router prices as a $2,500 put).
+    function testFork_CreateOrder_LeavesPairAndSideToRoles() public {
+        IOption daiCall = IOption(
+            FACTORY.createOption(
+                CreateParams({
+                    collateral: address(WETH),
+                    consideration: DAI,
+                    expirationDate: uint40(block.timestamp + 1 days),
+                    strike: 3_000e18,
+                    isPut: false,
+                    isEuro: true,
+                    windowSeconds: 1 hours
+                })
+            )
+        );
         IOption mislabeled = IOption(
             FACTORY.createOption(
                 CreateParams({
@@ -412,7 +427,8 @@ contract PositionRouterTest is Test {
                 })
             )
         );
-        _sell(1, mislabeled, _terms(mislabeled), abi.encodeWithSelector(IPositionRouter.MarketNotAllowed.selector));
+        _sell(1, daiCall, _terms(daiCall), "");
+        _sell(2, mislabeled, _terms(mislabeled), "");
     }
 
     /// @dev `option`'s own {CreateParams}, as a caller would restate them.
