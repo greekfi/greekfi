@@ -359,22 +359,16 @@ contract PositionRouterBebopTest is Test {
     {
         uint40 expiry = market.expirationDate();
         uint256 price = premium * 10 ** market.decimals() / amount;
-        return abi.encodeCall(
-            router.createOrder,
-            (
-                nonce,
-                market,
-                market.strike(),
-                expiry,
-                market.isPut(),
-                market.isEuro(),
-                uint40(market.exerciseDeadline() - expiry),
-                isBuy,
-                amount,
-                price,
-                duration
-            )
-        );
+        CreateParams memory terms = CreateParams({
+            collateral: market.collateral(),
+            consideration: market.consideration(),
+            expirationDate: expiry,
+            strike: market.strike(),
+            isPut: market.isPut(),
+            isEuro: market.isEuro(),
+            windowSeconds: uint40(market.exerciseDeadline() - expiry)
+        });
+        return abi.encodeCall(router.createOrder, (nonce, market, terms, isBuy, amount, price, duration));
     }
 
     /// @dev The maker sells the options back: it pays them, the router pays USDC.

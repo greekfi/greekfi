@@ -7,7 +7,7 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { ReentrancyGuardTransient } from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 
-import { IFactory } from "../interfaces/IFactory.sol";
+import { CreateParams, IFactory } from "../interfaces/IFactory.sol";
 import { IOption } from "../interfaces/IOption.sol";
 import { IReceipt } from "../interfaces/IReceipt.sol";
 import { IBebopSettlement } from "../interfaces/IBebopSettlement.sol";
@@ -130,10 +130,12 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     ///         intrinsic value for a sell, at most intrinsic plus the time-value tent for a buy.
     ///         {submitOrder} checks the fill's own price against the same bounds at fill time.
     ///
-    ///         `strike` through `windowSeconds` restate `option`'s terms and must match them exactly.
-    ///         They are in the calldata so the Roles Modifier can pin or bound them; the router
-    ///         checks them against the market. A put's `strike` is the inverted `1e36 / humanStrike`,
-    ///         so its bounds invert too.
+    ///         `terms` restates `option`'s {CreateParams}, all seven fields, token pair included, so
+    ///         the Roles Modifier can pin or bound each one. The router checks them against the
+    ///         factory: `FACTORY.optionFor(FACTORY.optionKey(terms))` must be `option`. The factory
+    ///         writes that entry once, when it deploys the market from exactly these params, so a
+    ///         match proves both that `option` is a factory market and that `terms` are its own.
+    ///         A put's `strike` is the inverted `1e36 / humanStrike`, so its bounds invert too.
     /// @param price    USDC base units per whole option (`10 ** option.decimals()` units): a sell's
     ///                 floor or a buy's cap, for the Roles Modifier to bound. The stored total rounds in
     ///                 the account's favour, up for a sell and down for a buy.
@@ -141,11 +143,7 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     function createOrder(
         uint256 nonce,
         IOption option,
-        uint256 strike,
-        uint40 expirationDate,
-        bool isPut,
-        bool isEuro,
-        uint40 windowSeconds,
+        CreateParams calldata terms,
         bool isBuy,
         uint256 amount,
         uint256 price,
@@ -153,17 +151,17 @@ contract PositionRouter is IPositionRouter, ReentrancyGuardTransient {
     ) external {
         if (amount == 0 || orders[msg.sender][nonce].amount != 0) revert InvalidOrder();
 
-        IReceipt receipt = _receiptOf(option);
-        if (
-            receipt.strike() != strike || receipt.expirationDate() != expirationDate || receipt.isPut() != isPut
-                || receipt.isEuro() != isEuro || receipt.exerciseDeadline() - expirationDate != windowSeconds
-        ) revert TermsMismatch();
+        // A zero `option` would otherwise match any terms the factory has never seen.
+        if (address(option) == address(0) || FACTORY.optionFor(FACTORY.optionKey(terms)) != address(option)) {
+            revert TermsMismatch();
+        }
 
-        address coll = address(receipt.collateral());
-        address cons = address(receipt.consideration());
+        (address coll, address cons) = (terms.collateral, terms.consideration);
+        (uint256 strike, uint40 expirationDate, bool isPut, uint40 windowSeconds) =
+            (terms.strike, terms.expirationDate, terms.isPut, terms.windowSeconds);
         // `isPut` is only a label in the factory; tie it to the collateral so the side Roles pins is real.
         if (
-            !isEuro || expirationDate > block.timestamp + MAX_TENOR || windowSeconds > MAX_WINDOW || isPut != (coll == USDC)
+            !terms.isEuro || expirationDate > block.timestamp + MAX_TENOR || windowSeconds > MAX_WINDOW || isPut != (coll == USDC)
                 || !((coll == WETH && cons == USDC) || (coll == USDC && cons == WETH))
         ) revert MarketNotAllowed();
 
