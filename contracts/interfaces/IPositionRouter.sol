@@ -16,10 +16,9 @@ interface IPositionRouter {
         uint256 premium;
     }
 
-    /// @notice `option` was not created by the router's factory.
+    /// @notice `option` was not created by the router's factory, or no factory market has the terms
+    ///         passed to {createOrder}.
     error UnknownOption();
-    /// @notice The terms passed to {createOrder} are not `option`'s own.
-    error TermsMismatch();
     /// @notice The order's market breaks the order rules.
     error MarketNotAllowed();
     /// @notice Zero amount or total premium, or the nonce already holds an open order.
